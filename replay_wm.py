@@ -36,7 +36,8 @@ from PIL import Image, ImageDraw
 
 from cwm import ConvWorldModel, grids_to_long, G, STATE_NAMES
 from replay import (_load_font, _grid_from_entry, _palette_img,
-                    _action_label, load_entries, resolve_path)
+                    _action_label, load_entries, resolve_path,
+                    _ensure_parent, _default_replay_out)
 
 
 # action name/id -> GameAction id 0..7 (RESET=0, ACTION1..7=1..7)
@@ -217,7 +218,8 @@ def main():
             r = bg
         padded.append(r)
 
-    out = args.out or os.path.splitext(path)[0].replace(".recording", "") + ".wm.gif"
+    out = args.out or _default_replay_out(path, ".wm.gif")
+    _ensure_parent(out)
     dur = int(1000 / max(0.1, args.fps))
     padded[0].save(out, save_all=True, append_images=padded[1:],
                    duration=dur, loop=0, optimize=True)

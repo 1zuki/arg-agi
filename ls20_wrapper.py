@@ -56,21 +56,53 @@ class Ls20Wrapper:
         if obs is None:
             return None, None, 0, True, {}
             
-        board_tokens, gui_pixels = self._process_frame(obs.frame)
+        processed = self._process_frame(obs.frame)
+        if processed is None:
+            return None, None, 0, True, {}
+        board_tokens, gui_pixels = processed
         return board_tokens, gui_pixels, 0, False, {}
 
     def step_raw(self, act_enum, data=None):
         obs = self.env.step(act_enum, data=data)
         if obs is None:
             return None, None, 0, True, {}
-        board_tokens, gui_pixels = self._process_frame(obs.frame)
+        processed = self._process_frame(obs.frame)
+        if processed is None:
+            return None, None, 0, True, {}
+        board_tokens, gui_pixels = processed
         return board_tokens, gui_pixels, 0, False, {}
 
+    def _grid_from_frame(self, frame_obj):
+        obj = frame_obj
+        for _ in range(8):
+            if hasattr(obj, "frame") and not isinstance(obj, (list, tuple, np.ndarray)):
+                obj = obj.frame
+                continue
+
+            arr = np.asarray(obj)
+            if arr.ndim >= 2:
+                while arr.ndim > 2:
+                    arr = arr[-1]
+                if arr.ndim == 2:
+                    return np.clip(arr.astype(int), 0, 15)
+
+            if isinstance(obj, (list, tuple)) and len(obj) > 0:
+                obj = obj[-1]
+                continue
+
+            if isinstance(arr, np.ndarray) and arr.dtype == object and arr.size > 0:
+                obj = arr.flat[-1]
+                continue
+
+            return None
+        return None
+
     def _process_frame(self, frame_obj):
-        arr = np.array(frame_obj)
-        while arr.ndim > 2:
-            arr = arr[-1]
-        arr = np.clip(arr.astype(int), 0, 15)
+        arr = self._grid_from_frame(frame_obj)
+        if arr is None or arr.ndim != 2:
+            return None
+        if arr.shape[0] < self.gui_start_y or arr.shape[1] < self.start_x + self.board_w:
+            return None
 
         # Trích xuất board 55x60
         board_pixels = arr[self.start_y : self.start_y + self.board_h, 

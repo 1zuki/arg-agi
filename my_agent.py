@@ -21,6 +21,7 @@
 # reward to propagate.
 # =====================================================================
 import logging
+import math
 import os
 import random
 import time
@@ -58,13 +59,20 @@ N_CLICK_CAND = 24         # click positions evaluated per planning step
 IMAGINE_W = 0.5           # weight on the model-based value-iteration loss
 CURIOSITY = float(os.getenv("ARC_CURIOSITY", "0.5"))  # novelty bonus weight
 
-# planner selection: "value" = 1-step lookahead, "bfs" = beam search
+# planner selection:
+#   value = 1-step lookahead
+#   bfs   = beam search over the learned CWM
+#   mcts  = UCB search over the learned CWM
 PLANNER = os.getenv("ARC_PLANNER", "value").lower()
 # BFS is bounded ON PURPOSE: the CWM is ~96% accurate per step, so error
 # compounds geometrically with depth. Depth 3 keeps leaf states ~0.96^3=88%
 # trustworthy; the beam prunes the branching so it stays cheap per step.
 BFS_DEPTH = int(os.getenv("ARC_BFS_DEPTH", "3"))
 BFS_BEAM = int(os.getenv("ARC_BFS_BEAM", "8"))
+MCTS_DEPTH = int(os.getenv("ARC_MCTS_DEPTH", str(BFS_DEPTH)))
+MCTS_SIMS = int(os.getenv("ARC_MCTS_SIMS", "32"))
+MCTS_CPUCT = float(os.getenv("ARC_MCTS_CPUCT", "1.4"))
+GAMEOVER_PENALTY = 3.0
 
 
 # ==================== agent ====================
@@ -227,6 +235,15 @@ class MyAgent(Agent):
         k = np.asarray(raw, dtype=np.int8).tobytes()
         s.visits[k] = s.visits.get(k, 0) + 1
 
+    def _score_next(s, next_grid, reward, state_logits, with_value=True):
+        win_p = F.softmax(state_logits, dim=-1)[:, WIN_IDX]
+        gameover_p = F.softmax(state_logits, dim=-1)[:, GAMEOVER_IDX]
+        nov = torch.from_numpy(s._novelty(next_grid)).to(s.device)
+        score = reward + WIN_BONUS * win_p - GAMEOVER_PENALTY * gameover_p + nov
+        if with_value:
+            score = score + GAMMA * s.tgt(next_grid)
+        return score, win_p, gameover_p
+
     @torch.no_grad()
     def _plan(s, raw, disc, click):
         """1-step CWM lookahead. Returns (kind, score_table) for the best action."""
@@ -238,10 +255,7 @@ class MyAgent(Agent):
         a = torch.tensor(aids, dtype=torch.long, device=s.device)
         cxy = torch.tensor(cxys, dtype=torch.long, device=s.device)
         next_grid, reward, _state_idx, state_logits = s.cwm.imagine(cur, a, cxy)
-        win_p = F.softmax(state_logits, dim=-1)[:, WIN_IDX]
-        v_next = s.tgt(next_grid)                          # frozen target value
-        nov = torch.from_numpy(s._novelty(next_grid)).to(s.device)
-        score = reward + WIN_BONUS * win_p + GAMMA * v_next + nov
+        score, _win_p, _gameover_p = s._score_next(next_grid, reward, state_logits)
         best = int(score.argmax().item())
         return kinds[best]
 
@@ -283,15 +297,12 @@ class MyAgent(Agent):
             a = torch.tensor(root_aids * reps, dtype=torch.long, device=s.device)
             cxy = torch.tensor(root_cxys * reps, dtype=torch.long, device=s.device)
             ng, reward, _si, sl = s.cwm.imagine(cur, a, cxy)
-            win_p = F.softmax(sl, dim=-1)[:, WIN_IDX]
-            v_leaf = s.tgt(ng)
-            nov = torch.from_numpy(s._novelty(ng)).to(s.device)
             ret_t = torch.tensor(base_ret, device=s.device)
             dsc_t = torch.tensor(base_disc, device=s.device)
-            step_val = reward + WIN_BONUS * win_p + nov
+            step_val, _win_p, _gameover_p = s._score_next(ng, reward, sl, with_value=False)
             cum_ret = ret_t + dsc_t * step_val             # return up to here
             # node score = path return + discounted leaf value (for ranking)
-            node_score = cum_ret + dsc_t * GAMMA * v_leaf
+            node_score = cum_ret + dsc_t * GAMMA * s.tgt(ng)
             # keep top-BFS_BEAM nodes for the next depth
             keep = min(BFS_BEAM, B)
             top = torch.topk(node_score, keep).indices.tolist()
@@ -303,6 +314,103 @@ class MyAgent(Agent):
         # best plan = highest full-estimate beam node; return its FIRST action
         best = int(np.argmax([ns for (_r, _d, _g, _f, ns) in beam]))
         return beam[best][3]
+
+    @torch.no_grad()
+    def _plan_mcts(s, raw, disc, click):
+        """UCB tree search over the learned CWM. Returns the first action."""
+        root_aids, root_cxys, root_kinds = s._candidates(raw, disc, click)
+        if not root_aids:
+            return None
+
+        class Node:
+            __slots__ = ("grid", "first", "immediate", "depth", "terminal",
+                         "children", "visits", "value_sum", "reason")
+
+            def __init__(self, grid, first=None, immediate=0.0, depth=0,
+                         terminal=False, reason=""):
+                self.grid = grid
+                self.first = first
+                self.immediate = immediate
+                self.depth = depth
+                self.terminal = terminal
+                self.children = []
+                self.visits = 0
+                self.value_sum = 0.0
+                self.reason = reason
+
+            @property
+            def value(self):
+                return self.value_sum / self.visits if self.visits else self.immediate
+
+        def expand(node):
+            if node.terminal or node.depth >= MCTS_DEPTH:
+                return float(s.tgt(node.grid.unsqueeze(0)).item())
+            if node.children:
+                return max(c.immediate for c in node.children)
+
+            n = len(root_aids)
+            cur = node.grid.unsqueeze(0).expand(n, G, G)
+            a = torch.tensor(root_aids, dtype=torch.long, device=s.device)
+            cxy = torch.tensor(root_cxys, dtype=torch.long, device=s.device)
+            ng, reward, _si, sl = s.cwm.imagine(cur, a, cxy)
+            score, win_p, gameover_p = s._score_next(ng, reward, sl, with_value=True)
+            step_score, _wp, _gp = s._score_next(ng, reward, sl, with_value=False)
+
+            best = -1e9
+            for i in range(n):
+                win = float(win_p[i].item())
+                gameover = float(gameover_p[i].item())
+                terminal = (
+                    win >= 0.50
+                    or gameover >= 0.75
+                    or node.depth + 1 >= MCTS_DEPTH
+                )
+                reason = "win" if win >= 0.50 else ("gameover" if gameover >= 0.75 else "search")
+                child = Node(
+                    ng[i],
+                    first=node.first if node.first is not None else root_kinds[i],
+                    immediate=float(step_score[i].item()),
+                    depth=node.depth + 1,
+                    terminal=terminal,
+                    reason=reason,
+                )
+                node.children.append(child)
+                best = max(best, float(score[i].item()))
+            return best
+
+        def ucb(parent, child):
+            return child.value + MCTS_CPUCT * math.sqrt(parent.visits + 1.0) / (1.0 + child.visits)
+
+        root = Node(grids_to_long(raw).to(s.device)[0])
+        for _ in range(max(1, MCTS_SIMS)):
+            node = root
+            path = [root]
+            while node.children and not node.terminal and node.depth < MCTS_DEPTH:
+                node = max(node.children, key=lambda c: ucb(path[-1], c))
+                path.append(node)
+
+            future = expand(node)
+            for n in reversed(path[1:]):
+                ret = n.immediate + GAMMA * future
+                n.visits += 1
+                n.value_sum += ret
+                future = ret
+            root.visits += 1
+            root.value_sum += future
+
+        if not root.children:
+            return None
+        best = max(
+            root.children,
+            key=lambda c: (
+                c.reason == "win",
+                c.reason != "gameover",
+                c.value,
+                c.immediate,
+                c.visits,
+            ),
+        )
+        return best.first
 
     # ---- value training: real TD + model-based value-iteration backup ----
     def _train(s):
@@ -327,8 +435,8 @@ class MyAgent(Agent):
             for aid in range(1, 6):
                 a = torch.full((BATCH,), aid, dtype=torch.long, device=s.device)
                 ng, r_a, _si, sl = s.cwm.imagine(st, a)
-                wp = F.softmax(sl, dim=-1)[:, WIN_IDX]
-                qs.append(r_a + WIN_BONUS * wp + GAMMA * s.tgt(ng))
+                score, _wp, _gp = s._score_next(ng, r_a, sl)
+                qs.append(score)
             vi_target = torch.stack(qs, dim=1).max(dim=1).values
         vi_loss = F.smooth_l1_loss(s.val(st), vi_target)
 
@@ -408,8 +516,12 @@ class MyAgent(Agent):
                     kind = ("disc", random.choice(sorted(disc))) if disc \
                         else ("click", random.randint(0, G - 1), random.randint(0, G - 1))
             else:
-                kind = (s._plan_bfs(raw, disc, click) if PLANNER == "bfs"
-                        else s._plan(raw, disc, click))
+                if PLANNER == "bfs":
+                    kind = s._plan_bfs(raw, disc, click)
+                elif PLANNER == "mcts":
+                    kind = s._plan_mcts(raw, disc, click)
+                else:
+                    kind = s._plan(raw, disc, click)
                 if kind is None:
                     a = GameAction.RESET; a.reasoning = "no_pick"
                     return a

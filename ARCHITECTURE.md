@@ -6,7 +6,7 @@ real interaction during play. It does **not** read the hidden game source.
 ## Why not the v31 "0.36" approach
 
 The v31 reference scores by reading the hidden game's `.py` file off the Kaggle
-filesystem, regex-extracting the exact win condition, and importing + deep-copyingj
+filesystem, regex-extracting the exact win condition, and importing + deep-copying
 the real game object to simulate it perfectly. That is reading the answer key, not
 generalizing. ARC-AGI-3 exists to measure generalization to novel unseen games, so
 that route circumvents the task, risks disqualification, and breaks the moment the
@@ -52,6 +52,82 @@ Curiosity: the world model's latent prediction error is added to the reward as a
 intrinsic bonus (`BETA_INT`), pushing the agent toward states the model can't yet
 predict — i.e. where there's something new to learn.
 
+## Current LS20 planner baseline
+
+For the local `ls20` experiment we currently use a pretrained observation-only
+world model in `ls20_model.pt` plus two lightweight planners:
+
+- `bfs`: beam search over imagined next states from the world model.
+- `mcts`: UCB-style Monte Carlo tree search over the same imagined transitions.
+- `both`: runs both planners, prints the comparison, and chooses an imagined win
+  first; otherwise it chooses the higher-scoring plan.
+
+By default `ls20_agent.py` runs the world model frozen. That keeps local tests
+cheap and avoids spending time fine-tuning on every probe. Add `--online-train`
+only when you intentionally want to keep updating the world model while playing.
+
+Recommended cheap local run:
+
+```bash
+/home/izu/Projects/.venv/.venv-310/bin/python ls20_agent.py \
+  --model ls20_model.pt \
+  --planner both \
+  --games 1 \
+  --max-steps 100 \
+  --depth 5 \
+  --beam 64 \
+  --mcts-sims 64 \
+  --commit-steps 2 \
+  --out recordings/agent_replay.npz
+```
+
+Replay the saved run:
+
+```bash
+/home/izu/Projects/.venv/.venv-310/bin/python replay_ls20.py \
+  --model ls20_model.pt \
+  --npz recordings/agent_replay.npz \
+  --out replays/ls20_comparison.gif
+```
+
+## Kaggle submission path
+
+The Kaggle notebook is generated from `_build_nb.py`. It inlines `cwm.py` into
+`my_agent.py`, writes `/kaggle/working/my_agent.py`, copies it into the official
+`ARC-AGI-3-Agents` harness, and runs `main.py --agent myagent` during competition
+reruns.
+
+Current notebook defaults:
+
+```bash
+ARC_PLANNER=bfs
+ARC_BFS_DEPTH=3
+ARC_BFS_BEAM=8
+ARC_MCTS_DEPTH=3
+ARC_MCTS_SIMS=32
+ARC_MCTS_CPUCT=1.4
+ARC_CWM=/kaggle/input/forge-pretrained-weights/cwm.pt
+```
+
+Planner options in `my_agent.py`:
+
+- `value`: cheapest one-step CWM lookahead.
+- `bfs`: default submission planner, shallow beam search over imagined states.
+- `mcts`: UCB search over imagined states; slower but now runnable locally and in
+  the generated notebook.
+
+Local planner comparison:
+
+```bash
+/home/izu/Projects/.venv/.venv-310/bin/python compare_planners.py \
+  --game ls20 \
+  --planners value bfs mcts \
+  --max-actions 50 \
+  --bfs-depth 3 \
+  --bfs-beam 8 \
+  --mcts-sims 32
+```
+
 ### The deliberate safety choices
 
 - **Short imagined rollouts (K=3), not long ones.** A DQN's `max` exploits model
@@ -86,6 +162,10 @@ BATCH=64  TRAIN_EVERY=4  IMAGINE_K=3  IMAGINE_W=0.5
 
 - `my_agent.py` — the agent (verified: compiles, forward/backward pass, all action
   branches exercised by `_smoke.py`).
+- `ls20_agent.py` — local LS20 world-model planner with `bfs`, `mcts`, and `both`
+  modes.
+- `compare_ls20_wm.py` — compares the LS20 world model's predicted next state
+  against real engine observations.
 - `arc-agi.ipynb` — submission notebook: install wheels → write agent → wire into the
   competition harness on rerun → local submission stub.
 - `_smoke.py` — offline test harness (stubs `arcengine`/`agents.agent`).

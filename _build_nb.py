@@ -93,6 +93,13 @@ c2 = code_cell(
     "OPERATION_MODE=online\n"
     "RECORDINGS_DIR=/kaggle/working/server_recording\n"
     "\"\"\")\n"
+    "    os.environ.setdefault('ARC_PLANNER', 'bfs')\n"
+    "    os.environ.setdefault('ARC_BFS_DEPTH', '3')\n"
+    "    os.environ.setdefault('ARC_BFS_BEAM', '8')\n"
+    "    os.environ.setdefault('ARC_MCTS_DEPTH', '3')\n"
+    "    os.environ.setdefault('ARC_MCTS_SIMS', '32')\n"
+    "    os.environ.setdefault('ARC_MCTS_CPUCT', '1.4')\n"
+    "    os.environ.setdefault('ARC_CWM', '/kaggle/input/forge-pretrained-weights/cwm.pt')\n"
     "    !cd /kaggle/working/ARC-AGI-3-Agents && MPLBACKEND=agg python main.py --agent myagent"
 )
 
@@ -121,6 +128,10 @@ with open(out, "w", encoding="utf-8") as f:
 print("wrote", out)
 
 # validate
-import nbformat
-nbformat.read(out, as_version=4)
-print("nbformat validation OK")
+try:
+    import nbformat
+except ModuleNotFoundError:
+    print("nbformat not installed; skipped nbformat validation")
+else:
+    nbformat.read(out, as_version=4)
+    print("nbformat validation OK")

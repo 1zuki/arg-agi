@@ -3,7 +3,7 @@ from ls20_model import Ls20WorldModel
 
 def expand():
     try:
-        saved = torch.load("ls20_model.pt", map_location="cpu")
+        saved = torch.load("ls20_model.pt", map_location="cpu", weights_only=False)
     except Exception as e:
         print("Lỗi đọc file:", e)
         return

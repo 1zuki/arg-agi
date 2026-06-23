@@ -2,6 +2,7 @@
 import sys
 import os
 import numpy as np
+from pathlib import Path
 
 # Thêm đường dẫn để có thể import package từ offline environment
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,12 +32,15 @@ def analyze_ls20():
     
     print("Kích thước lưới ban đầu:", arr.shape)
     
+    out = Path("debug") / "ls20_frame.txt"
+    out.parent.mkdir(parents=True, exist_ok=True)
+
     # In lưới ra file text để model có thể đọc
-    with open("ls20_frame.txt", "w") as f:
+    with out.open("w") as f:
         for r in range(arr.shape[0]):
             f.write("".join([f"{c:x}" for c in arr[r, :]]) + "\n")
             
-    print("Đã lưu lưới vào ls20_frame.txt")
+    print(f"Đã lưu lưới vào {out}")
 
 if __name__ == "__main__":
     analyze_ls20()

@@ -1,6 +1,6 @@
 from PIL import Image, ImageDraw
 import numpy as np
-import os
+from pathlib import Path
 
 PALETTE = [
     (0, 0, 0), (0, 116, 217), (255, 65, 54), (46, 204, 64),
@@ -15,7 +15,8 @@ def hex_to_int(c):
     except:
         return 0
 
-with open('ls20_frame.txt', 'r') as f:
+input_file = Path("debug") / "ls20_frame.txt"
+with input_file.open("r") as f:
     lines = [list(line.strip()) for line in f if line.strip()]
 
 H, W = len(lines), len(lines[0])
@@ -54,6 +55,7 @@ for x in range(start_x, end_x + 1, 5):
 for y in range(start_y, end_y + 1, 5):
     draw.line([(start_x*SCALE, y*SCALE), (end_x*SCALE, y*SCALE)], fill="red", width=1)
 
-output_file = "ls20_visualized.png"
+output_file = Path("debug") / "ls20_visualized.png"
+output_file.parent.mkdir(parents=True, exist_ok=True)
 img.save(output_file)
 print(f"Đã lưu ảnh trực quan hóa vào: {output_file}")

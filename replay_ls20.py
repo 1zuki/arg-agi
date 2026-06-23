@@ -17,6 +17,11 @@ PALETTE = [
     (133, 100, 4), (255, 255, 255), (96, 96, 96), (44, 60, 117),
 ]
 
+def _ensure_parent(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
 def _palette_img(grid, scale):
     h, w = grid.shape
     lut = np.array(PALETTE, dtype=np.uint8)
@@ -72,7 +77,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="ls20_model.pt", help="Đường dẫn đến file model đã train")
     ap.add_argument("--steps", type=int, default=50, help="Số bước muốn visualize")
-    ap.add_argument("--out", default="ls20_comparison.gif", help="Tên file GIF đầu ra")
+    ap.add_argument("--out", default="replays/ls20_comparison.gif", help="Tên file GIF đầu ra")
     ap.add_argument("--scale", type=int, default=6, help="Scale pixel (to lên cho dễ nhìn)")
     ap.add_argument("--npz", default=None, help="Đường dẫn đến file agent_replay.npz để xem lại")
     args = ap.parse_args()
@@ -83,7 +88,7 @@ def main():
         sys.exit(f"Không tìm thấy {args.model}. Hãy chờ pretrain xong.")
         
     print(f"Load model từ {args.model}...")
-    saved = torch.load(args.model, map_location=device)
+    saved = torch.load(args.model, map_location=device, weights_only=False)
     num_tokens = saved["num_tokens"]
     id_to_block = saved["id_to_block"]
     
@@ -140,6 +145,7 @@ def main():
             frames.append(img)
             
         if frames:
+            _ensure_parent(args.out)
             frames[0].save(args.out, save_all=True, append_images=frames[1:], duration=300, loop=0)
             print(f"Đã lưu GIF so sánh tại {args.out}")
         return
@@ -204,6 +210,7 @@ def main():
         board, gui = true_b, true_g
         
     if frames:
+        _ensure_parent(args.out)
         frames[0].save(args.out, save_all=True, append_images=frames[1:], duration=300, loop=0)
         print(f"Đã lưu GIF so sánh tại {args.out}")
     else:

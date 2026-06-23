@@ -173,6 +173,17 @@ def resolve_path(p):
     return p
 
 
+def _ensure_parent(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _default_replay_out(path, suffix=".gif"):
+    stem = os.path.splitext(os.path.basename(path))[0].replace(".recording", "")
+    return os.path.join("replays", stem + suffix)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Replay an ARC-AGI-3 recording to GIF.")
     ap.add_argument("recording", help="path to .recording.jsonl (or a directory)")
@@ -215,7 +226,8 @@ def main():
         padded.append(f)
     frames = padded
 
-    out = args.out or os.path.splitext(path)[0].replace(".recording", "") + ".gif"
+    out = args.out or _default_replay_out(path)
+    _ensure_parent(out)
     dur_ms = int(1000 / max(0.1, args.fps))
     frames[0].save(out, save_all=True, append_images=frames[1:],
                    duration=dur_ms, loop=0, optimize=True)

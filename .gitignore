@@ -1,6 +1,12 @@
 *.pt
 *.npz
 *.npy
+*.gif
+
+# Project runtime/debug artifacts
+debug/
+replays/
+recordings/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -4,6 +4,7 @@
 #
 #   value : 1-step CWM lookahead  (cheap, shallow)
 #   bfs   : depth-N beam search over the learned CWM  (deeper, costlier)
+#   mcts  : UCB tree search over the learned CWM       (adaptive, costlier)
 #
 # Both use the SAME frozen world model and value net; the only difference
 # is how far they look ahead before committing to an action. For each game
@@ -15,7 +16,7 @@
 #
 # Usage:
 #   python compare_planners.py --game ls20 ft09 vc33 --max-actions 200
-#   python compare_planners.py --game ls20 --bfs-depth 3 --bfs-beam 8
+#   python compare_planners.py --game ls20 --bfs-depth 3 --bfs-beam 8 --mcts-sims 32
 # =====================================================================
 import argparse
 import logging
@@ -76,14 +77,17 @@ def _run_one(gid, planner, max_actions, seed):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Compare value vs bfs CWM planners on offline games.")
+    ap = argparse.ArgumentParser(description="Compare value, bfs, and mcts CWM planners on offline games.")
     ap.add_argument("--game", nargs="+", required=True, help="game id(s), e.g. ls20 ft09")
     ap.add_argument("--max-actions", type=int, default=200)
-    ap.add_argument("--planners", nargs="+", default=["value", "bfs"],
-                    choices=["value", "bfs"])
+    ap.add_argument("--planners", nargs="+", default=["value", "bfs", "mcts"],
+                    choices=["value", "bfs", "mcts"])
     ap.add_argument("--weights", default="cwm.pt", help="CWM weights (sets ARC_CWM)")
     ap.add_argument("--bfs-depth", type=int, default=3)
     ap.add_argument("--bfs-beam", type=int, default=8)
+    ap.add_argument("--mcts-depth", type=int, default=None)
+    ap.add_argument("--mcts-sims", type=int, default=32)
+    ap.add_argument("--mcts-cpuct", type=float, default=1.4)
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -93,6 +97,9 @@ def main():
     os.environ["ENVIRONMENTS_DIR"] = str(ENV_DIR)
     os.environ["ARC_BFS_DEPTH"] = str(args.bfs_depth)
     os.environ["ARC_BFS_BEAM"] = str(args.bfs_beam)
+    os.environ["ARC_MCTS_DEPTH"] = str(args.mcts_depth if args.mcts_depth is not None else args.bfs_depth)
+    os.environ["ARC_MCTS_SIMS"] = str(args.mcts_sims)
+    os.environ["ARC_MCTS_CPUCT"] = str(args.mcts_cpuct)
     wp = Path(args.weights).resolve()
     if wp.exists():
         os.environ["ARC_CWM"] = str(wp)
@@ -142,10 +149,12 @@ def main():
         if "error" not in r:
             by_game.setdefault(r["game"], {})[r["planner"]] = r["levels"]
     for g, d in by_game.items():
-        v, b = d.get("value"), d.get("bfs")
-        if v is not None and b is not None:
-            verdict = "tie" if v == b else ("bfs" if b > v else "value")
-            print(f"  {g}: value={v}  bfs={b}  -> {verdict}")
+        parts = [f"{p}={d[p]}" for p in args.planners if p in d]
+        if parts:
+            best_score = max(d.values())
+            winners = [p for p, score in d.items() if score == best_score]
+            verdict = "tie:" + ",".join(sorted(winners)) if len(winners) > 1 else winners[0]
+            print(f"  {g}: {'  '.join(parts)}  -> {verdict}")
 
 
 if __name__ == "__main__":
