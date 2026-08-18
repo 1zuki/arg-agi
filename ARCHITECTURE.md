@@ -1,171 +1,103 @@
-# Dyna-WM baseline — ARC-AGI-3
+# ARC-AGI-3 Submission Architecture
 
-A legitimate, observation-only model-based RL agent. It learns each game from
-real interaction during play. It does **not** read the hidden game source.
+This repository now uses the Tufa Labs duck harness notebook as the primary
+ARC-AGI-3 submission path. The root notebook, `arc-agi.ipynb`, is a Kaggle
+launcher for the TAAF source bundle and benchmark artifacts attached as Kaggle
+datasets.
 
-## Why not the v31 "0.36" approach
+The previous local CWM/RL baseline files have been removed from this repo
+snapshot. The submission is no longer generated from `_build_nb.py`, and it no
+longer relies on the in-repo `my_agent.py`, `cwm.py`, LS20 planners, or local
+world-model checkpoints.
 
-The v31 reference scores by reading the hidden game's `.py` file off the Kaggle
-filesystem, regex-extracting the exact win condition, and importing + deep-copying
-the real game object to simulate it perfectly. That is reading the answer key, not
-generalizing. ARC-AGI-3 exists to measure generalization to novel unseen games, so
-that route circumvents the task, risks disqualification, and breaks the moment the
-organizers sandbox the game source. We reuse v31 only for the toolkit interface
-(`Agent` subclass, `arcengine` action calls, Kaggle scaffolding).
+## Primary Notebook
 
-## The idea, in one line
+`arc-agi.ipynb` is copied from the Tufa Labs duck harness milestone notebook. It
+performs the following steps:
 
-Two cooperating models: a **world model** that learns to *see* the game (predict
-what happens next), and a **DQN** that learns to *win* (maximize reward), with the
-world model's prediction error doubling as a curiosity signal that drives
-exploration.
+1. Detects whether Kaggle is running a real competition rerun by checking
+   `KAGGLE_IS_COMPETITION_RERUN`.
+2. Installs the official ARC runtime from the competition wheelhouse at
+   `/kaggle/input/competitions/arc-prize-2026-arc-agi-3/arc_agi_3_wheels`.
+3. Finds the attached TAAF source dataset by locating
+   `taaf-kaggle-bundle.json` under `/kaggle/input`.
+4. Adds the bundled TAAF source repositories to `sys.path` and writes a `.pth`
+   file so child processes can import them.
+5. Runs the bundle's `setup_commands.json`. These commands are responsible for
+   preparing the solver runtime, including the local vLLM/Qwen FP8 analyzer
+   server and any wheel/model setup required by the bundle.
+6. Unpickles the deployed target and benchmark from `deploy_target.pkl` and
+   `benchmark_initial.pkl` in the source bundle.
+7. Runs the benchmark and writes outputs under `/kaggle/working`.
 
-## Components
+The notebook contains infrastructure and diagnostics only. The actual solver
+implementation lives in the attached TAAF source dataset, not in this repository.
 
-| Piece        | Input → Output                                  | Role |
-|--------------|-------------------------------------------------|------|
-| `Encoder`    | grid (18×64×64) → latent `z` (128) + spatial feat | shared perception |
-| `WorldModel` | (`z`, action) → next `z`, predicted reward      | model 1 — "sees the game" |
-| `q_discrete` | `z` → Q-values for ACTION1..5                   | model 2 — "wants to win" |
-| `ClickHead`  | spatial feat → 64×64 Q-map for ACTION6          | model 2 — spatial wins |
-| Curiosity    | ‖predicted `z` − actual `z`‖² → intrinsic reward | exploration drive |
+## Required Kaggle Inputs
 
-Observation = 16 colour one-hot planes + 2 coordinate planes. Actions follow the
-ARC-AGI-3 space: ACTION1–4 (directions), ACTION5 (interact), ACTION6 (x,y click),
-ACTION7 (undo), RESET.
+The notebook expects these attached Kaggle inputs:
 
-## Training — Dyna style
+- `jeroencottaar/taaf-kaggle-source-share`
+- `driessmit1/arc3-vllm-h100-wheelhouse-v3`
+- `driessmit1/vrfai-qwen3-6-27b-fp8-hf-snapshot`
+- the competition dataset mounted at
+  `/kaggle/input/competitions/arc-prize-2026-arc-agi-3`
 
-Every few env steps we sample a batch from replay and compute three losses:
+Kaggle may mount datasets either at `/kaggle/input/<slug>` or at
+`/kaggle/input/datasets/<owner>/<slug>`. The notebook records the resolved paths
+in `TAAF_KAGGLE_INPUT_PATHS` for the setup commands and solver.
 
-1. **Real TD loss.** Standard DQN target on actually-observed transitions, over the
-   *available* action set (discrete and click masked to what the frame allows). A
-   soft-updated target network stabilizes the bootstrap.
-2. **World-model loss.** Supervised next-latent + reward prediction on real steps.
-   This is what makes model 1 accurate.
-3. **Imagined Dyna loss.** Short `K`-step latent rollouts (`K=3`) branched from real
-   encoded states, training the DQN on transitions the world model *imagines*. This
-   is the sample-efficiency multiplier — many cheap gradient updates per scarce real
-   step.
+## Submission and Offline Behavior
 
-Curiosity: the world model's latent prediction error is added to the reward as an
-intrinsic bonus (`BETA_INT`), pushing the agent toward states the model can't yet
-predict — i.e. where there's something new to learn.
+In a real competition rerun, `TRUE_SUBMISSION` is true. The notebook minimizes
+diagnostics, waits for the Kaggle gateway, builds the live competition game list,
+and runs against the competition Arcade.
 
-## Current LS20 planner baseline
+In an interactive Save & Run, `TRUE_SUBMISSION` is false. The notebook uses the
+competition dataset's bundled `environment_files` offline, keeps diagnostics
+enabled, and creates a stub `submission.parquet` so Kaggle has an output file
+even though the offline run is not scored.
 
-For the local `ls20` experiment we currently use a pretrained observation-only
-world model in `ls20_model.pt` plus two lightweight planners:
+Both modes write run artifacts to `/kaggle/working`. During startup the launcher
+also refreshes `/kaggle/working/taaf_run_manifest.json` and
+`/kaggle/working/taaf_run_summary.txt` with non-secret run metadata: submission
+mode, Python/platform info, known safe TAAF/Kaggle environment knobs, attached
+input refs and resolved paths, bundle path, selected solver attributes, and
+offline selected game ids for non-submission runs. Non-submission runs may also
+render `diagnostics.html` inline.
 
-- `bfs`: beam search over imagined next states from the world model.
-- `mcts`: UCB-style Monte Carlo tree search over the same imagined transitions.
-- `both`: runs both planners, prints the comparison, and chooses an imagined win
-  first; otherwise it chooses the higher-scoring plan.
+The launcher supports a few environment knobs for iteration. `TAAF_OFFLINE_GAMES`
+and `TAAF_OFFLINE_MAX_GAMES` only apply to non-submission Save & Run offline
+games. `TAAF_BENCHMARK_CONCURRENCY`, `TAAF_ANALYZER_TIMEOUT`,
+`TAAF_MAX_ACTIONS_PER_GAME`, and `TAAF_MAX_RUNTIME_S_PER_GAME` override the
+matching `bm.solver` attributes after the benchmark is loaded. Invalid values
+raise clear launcher errors instead of silently changing behavior.
 
-By default `ls20_agent.py` runs the world model frozen. That keeps local tests
-cheap and avoids spending time fine-tuning on every probe. Add `--online-train`
-only when you intentionally want to keep updating the world model while playing.
+## Preserved Runtime Assets
 
-Recommended cheap local run:
+The broad official/runtime assets remain in this repo for now:
 
-```bash
-/home/izu/Projects/.venv/.venv-310/bin/python ls20_agent.py \
-  --model ls20_model.pt \
-  --planner both \
-  --games 1 \
-  --max-steps 100 \
-  --depth 5 \
-  --beam 64 \
-  --mcts-sims 64 \
-  --commit-steps 2 \
-  --out recordings/agent_replay.npz
-```
+- `ARC-AGI-3-Agents/`
+- `arc_agi_3_wheels/`
+- `environment_files/`
+- `.gitignore`, `LICENSE`, and `Dockerfile`
 
-Replay the saved run:
+These are kept because they are official/runtime support files or useful local
+reference material, and they are not part of the removed CWM/RL baseline.
 
-```bash
-/home/izu/Projects/.venv/.venv-310/bin/python replay_ls20.py \
-  --model ls20_model.pt \
-  --npz recordings/agent_replay.npz \
-  --out replays/ls20_comparison.gif
-```
+## Risks and Caveats
 
-## Kaggle submission path
-
-The Kaggle notebook is generated from `_build_nb.py`. It inlines `cwm.py` into
-`my_agent.py`, writes `/kaggle/working/my_agent.py`, copies it into the official
-`ARC-AGI-3-Agents` harness, and runs `main.py --agent myagent` during competition
-reruns.
-
-Current notebook defaults:
-
-```bash
-ARC_PLANNER=bfs
-ARC_BFS_DEPTH=3
-ARC_BFS_BEAM=8
-ARC_MCTS_DEPTH=3
-ARC_MCTS_SIMS=32
-ARC_MCTS_CPUCT=1.4
-ARC_CWM=/kaggle/input/forge-pretrained-weights/cwm.pt
-```
-
-Planner options in `my_agent.py`:
-
-- `value`: cheapest one-step CWM lookahead.
-- `bfs`: default submission planner, shallow beam search over imagined states.
-- `mcts`: UCB search over imagined states; slower but now runnable locally and in
-  the generated notebook.
-
-Local planner comparison:
-
-```bash
-/home/izu/Projects/.venv/.venv-310/bin/python compare_planners.py \
-  --game ls20 \
-  --planners value bfs mcts \
-  --max-actions 50 \
-  --bfs-depth 3 \
-  --bfs-beam 8 \
-  --mcts-sims 32
-```
-
-### The deliberate safety choices
-
-- **Short imagined rollouts (K=3), not long ones.** A DQN's `max` exploits model
-  error; long rollouts from a still-weak model train toward hallucinations. Short
-  rollouts cap how far error compounds.
-- **Imagined loss down-weighted** (`IMAGINE_W=0.5`) relative to real TD loss, so
-  real data dominates while the model is unreliable.
-- **Imagined rollouts use discrete actions only.** The 4096-way click space is too
-  large to imagine reliably; clicks are learned from real transitions only.
-
-## Key constants (top of `my_agent.py`)
-
-```
-D=128  GAMMA=0.99  TAU=0.01  BETA_INT=0.5  LR=3e-4
-BATCH=64  TRAIN_EVERY=4  IMAGINE_K=3  IMAGINE_W=0.5
-```
-
-## Honest limitations
-
-- **From-scratch online learning is hard here.** ARC-AGI-3 gives a limited action
-  budget per novel game; a DQN learning from zero may not converge before the budget
-  runs out. The world model + imagined Dyna improves sample efficiency but does not
-  eliminate this risk. Frontier systems currently score near zero on these games.
-- **Next step if scores are low:** pre-train the encoder + world model offline on the
-  public games to learn general dynamics priors, then adapt online per hidden game.
-  The architecture supports this — only the weight-loading path needs adding.
-- **If the separate DQN and world model fight**, the proven consolidation is
-  DreamerV3 / EfficientZero, which fold value learning *into* the world model rather
-  than keeping a standalone DQN.
-
-## Files
-
-- `my_agent.py` — the agent (verified: compiles, forward/backward pass, all action
-  branches exercised by `_smoke.py`).
-- `ls20_agent.py` — local LS20 world-model planner with `bfs`, `mcts`, and `both`
-  modes.
-- `compare_ls20_wm.py` — compares the LS20 world model's predicted next state
-  against real engine observations.
-- `arc-agi.ipynb` — submission notebook: install wheels → write agent → wire into the
-  competition harness on rerun → local submission stub.
-- `_smoke.py` — offline test harness (stubs `arcengine`/`agents.agent`).
+- GPU and dataset dependency: the notebook depends on the attached TAAF datasets,
+  the FP8 Qwen snapshot, the vLLM wheelhouse, and the correct Kaggle GPU selection
+  noted by the original notebook.
+- Timeout risk: setup starts local analyzer infrastructure and then runs the
+  benchmark. Long startup, gateway delay, or slow games can still consume the
+  notebook budget.
+- Solver opacity in this repo: the actual solver code is in the attached dataset.
+  Reviewing only this repository does not review the solver logic.
+- Attribution and baseline caveat: this path uses the public Tufa Labs duck
+  harness/milestone submission approach. Any use should preserve attribution and
+  account for competition rules and public-baseline expectations.
+- Reproducibility: this repository alone is not a complete reproducible
+  submission. The exact Kaggle attached datasets and their versions are part of
+  the runtime.
