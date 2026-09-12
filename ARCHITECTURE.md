@@ -2,7 +2,9 @@
 
 This repository uses the public Tufa Labs duck harness as its ARC-AGI-3 solver
 base. The root `arc-agi.ipynb` is a Kaggle launcher for a narrowly modified
-candidate: Qwen3.8 with xhigh reasoning plus an eight-action batch checkpoint.
+candidate: Qwen3.8 with xhigh reasoning, an eight-action batch checkpoint, and
+two adapter correctness fixes. Engine `ACTION7` is exposed as `UNDO`, and a
+host-issued automatic reset now synchronizes the analyzer before the next turn.
 The candidate is intentionally close to upstream TAAF; it does not add a new
 planner, prompt replacement, state graph, or other handcrafted solver system.
 
@@ -32,10 +34,10 @@ performs the following steps:
    metadata entries in the dataset's `crc32.txt` are corrected only after the
    mounted files match the immutable Hugging Face revision by pinned SHA-256.
 6. Copies the read-only TAAF bundle to
-   `/kaggle/working/taaf-qwen38-checkpoint8-bundle`.
-7. Applies the exact checkpoint-8 logic to `framework/solver.py` and
-   `agent/tool_agent.py`, and substitutes Qwen3.8/xhigh into
-   `setup_commands.json`.
+   `/kaggle/working/taaf-qwen38-checkpoint8-undo-sync-bundle`.
+7. Applies the checkpoint-8 logic and automatic-reset synchronization to
+   `framework/solver.py`/`agent/tool_agent.py`, maps `ACTION7` to `UNDO` in
+   `action_names.py`, and substitutes Qwen3.8/xhigh into `setup_commands.json`.
 8. Verifies the complete post-patch tree digest and critical file hashes. A
    missing, extra, or changed file, duplicate patch anchor, unexpected model
    snapshot, or incomplete shard set aborts the run before imports or
@@ -59,13 +61,17 @@ authors is preserved in the notebook.
 
 The candidate identity is:
 
-- variant: `taaf-qwen38-xhigh-checkpoint8`;
+- variant: `taaf-qwen38-xhigh-checkpoint8-undo-sync`;
 - model: `Qwen/Qwen3.8-27B-FP8` at immutable Hugging Face revision
   `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`;
 - reasoning: `xhigh`, supplied as a vLLM default chat-template argument;
 - source change: execute at most eight actions from one model-requested batch,
   then return the settled board, limit, unexecuted suffix, and re-grounding
   instruction;
+- adapter fixes: expose engine action 7 as `UNDO` in both directions; after an
+  automatic reset, clear stale conversational/world-model state, persist the
+  reset result, and stop without another model request if reset remains
+  terminal;
 - runtime: concurrency 28, analyzer timeout 900 seconds, per-game runtime cap
   7,920 seconds, one pass, plus a global soft deadline at 30,600 seconds from
   notebook start (30 minutes before the pinned nine-hour deployment limit);
@@ -175,18 +181,18 @@ cap-8 pair used the native/8x visual setup, these local groups are supporting
 evidence rather than a clean one-variable estimate of checkpoint-8. The same
 public evidence records Kaggle submission `55551321` at `2.03`.
 
-Those scores are prior external evidence, not results from this repository.
-Local checks can prove patch fidelity and syntax, but cannot serve or exercise
-the 31 GB model on this machine's RTX 4050. A successful RTX Pro 6000 Kaggle
-Save & Run, full 25-game offline run, and competition rerun remain required
-before making a score claim for this notebook.
+The previous repository candidate completed an audited 25-public-game Kaggle
+run on 2026-09-08 with mean score `4.671335090995715`, 27 total levels cleared,
+and positive score on 18 of 25 games. Its traces contained 27 `ACTION7` attempts,
+seven explicit unknown-action errors, 62 stale game-over prompt occurrences,
+and 452 analyzer turn-budget yields. Those counts motivated the two adapter
+fixes, but they do not establish a score gain. Local checks can prove patch
+fidelity and syntax, but cannot serve or exercise the 31 GB model on this
+machine's RTX 4050. A new RTX Pro 6000 preflight/full run and competition rerun
+remain required before making a score claim for the `undo-sync` candidate.
 
 ## Deliberately Deferred Follow-ups
 
-- `ACTION7`: the public source exposes ACTION7 from the engine but does not map
-  it back in `action_names.py`, so a requested ACTION7 can become a silent
-  no-op. The scored `2.03` source used only checkpoint-8, so ACTION7 is kept as
-  a separately measured follow-up rather than bundled into this candidate.
 - HUD/no-impact filtering: public external evidence suggests it may help some
   games, but it is materially more invasive. It is deferred until the minimal
   Qwen3.8/checkpoint-8 candidate is reproduced.

@@ -1,16 +1,17 @@
-# ARC-AGI-3 Qwen3.8 + checkpoint-8 candidate
+# ARC-AGI-3 Qwen3.8 + checkpoint-8 + adapter-fix candidate
 
 The primary submission notebook is `arc-agi.ipynb`. It preserves the public
 [Tufa Labs duck harness](https://github.com/Tufalabs/duck-harness) as the solver
 base, swaps its local analyzer to `Qwen/Qwen3.8-27B-FP8` at revision
 `017b9c7af6b5689d5dd426a76e0bc077eb5ca20a`, requests `xhigh` reasoning, and
-adds one isolated policy change: a checkpoint after eight actions from a single
-batched `action(...)` call.
+keeps the checkpoint after eight actions from a single batched `action(...)`
+call, maps engine `ACTION7` to the model-facing `UNDO` action, and synchronizes
+the analyzer's state after automatic resets.
 
-This is the primary candidate, not a locally proven score improvement. The
-repository can validate the patch and provenance locally; serving the 31 GB
-FP8 model and completing gameplay require an RTX Pro 6000 Kaggle Save & Run and
-then a competition rerun.
+This is the primary candidate, not yet a measured score improvement over the
+previous checkpoint-8 variant. The repository can validate the patch and
+provenance locally; serving the 31 GB FP8 model and completing gameplay require
+an RTX Pro 6000 Kaggle Save & Run and then a competition rerun.
 
 Required Kaggle inputs:
 
@@ -23,6 +24,15 @@ The old local CWM/RL baseline path has been removed from this snapshot. See
 `ARCHITECTURE.md` for the current submission flow and remaining risks.
 
 ## Why this candidate
+
+The previous repository candidate completed an audited 25-public-game Kaggle
+run on 2026-09-08 with a mean score of `4.671335090995715`, 27 levels cleared,
+and positive score on 18 of 25 games. Trace analysis exposed two deterministic
+adapter defects: `ACTION7` was advertised but rejected by the reverse action
+mapping, and automatic reset could leave stale terminal context in the analyzer.
+The new candidate changes only those defects while preserving the measured
+model, sampling, checkpoint, and runtime settings. Its score remains unverified
+until it is rerun.
 
 Public external evidence in
 [sonpham-org/arc-3](https://github.com/sonpham-org/arc-3/tree/3ba35ce5a9a81efc068f0b40db1b1e92c785d588)
@@ -60,8 +70,8 @@ normal scored-shape runs retain the full 7,920-second per-game policy.
 Kaggle inputs are read-only. The launcher therefore verifies the complete
 73-file TAAF tree digest plus critical source and benchmark-pickle hashes,
 copies the 1.7 MB bundle to
-`/kaggle/working`, applies the exact 19-line checkpoint-8 source change and
-Qwen3.8 setup substitutions, verifies the post-patch hashes, and only then
+`/kaggle/working`, applies the checkpoint-8 and adapter fixes plus Qwen3.8 setup
+substitutions, verifies the post-patch hashes, and only then
 updates `sys.path` and unpickles the benchmark.
 It also verifies the model metadata hashes, FP8 architecture, xhigh-capable chat
 template, exact 80-file inventory, and all 77 payload CRCs (including 66 weight
@@ -159,8 +169,9 @@ experiments fail by default. `--allow-solver-overrides` accepts only positive
 overrides that also match the recorded `TAAF_*` manifest values, and still
 reports them as warnings.
 
-No Kaggle upload, run, competition rerun, or submission has been performed from
-this repository preparation workflow.
+The previous checkpoint-8 candidate has completed one full public-game Kaggle
+run. No Kaggle upload, run, competition rerun, or submission has been performed
+for the new `undo-sync` candidate from this workflow.
 
 ## Verification gate
 
@@ -171,5 +182,70 @@ Before treating this as a submission improvement:
 3. Only after both audited gates pass, run the full package as a competition
    rerun and require a passing `--mode submission` audit.
 
-Do not claim the external `2.03` or public-game scores as this notebook's result
-until those gates pass.
+Do not claim the external `2.03` or the prior candidate's `4.6713` public-game
+mean as this new notebook's result until those gates pass.
+
+## Isolated Flash-Next/MTP candidate (2026-09-11)
+
+`arc-agi-flash-next-mtp.ipynb` and `scripts/build_flash_next_package.py`
+package a separate candidate based on Keith Tyser's public serving stack;
+they do not replace the checkpoint-8 incumbent (recorded public score `1.31`).
+The full candidate completed its competition rerun as kernel version 1, and
+submission `56170646` received a public score of **3.40**, above the recorded
+1.31 checkpoint-8 incumbent. The local 25-game mean
+`5.502654474314745` is offline-only and is not a leaderboard score.
+
+- Preflight `izukia/arc-agi3-flash-next-mtp-preflight/6` completed and passed
+  `scripts/audit_flash_output.py`. Output: `build/kaggle-output/flash-preflight-v6`.
+  The local package folder is `build/kaggle-flash-preflight-v7`; its name is
+  not the Kaggle version number.
+- The preflight produced 1,016 actions and score `0` on `tn36-ef4dde99`.
+  Its 1,800-second soft deadline is measured from notebook start (including
+  setup), not 30 minutes of gameplay. Deadline cancellation is acceptable
+  only for the preflight smoke test; the full audit rejects cancelled runs.
+- The pinned teardown patch captures metrics once, waits for delayed GPU
+  release, and retains the original process-identity, port, GPU-query,
+  metric-preservation, and artifact-preservation gates. Preflight observed
+  `shutdown_ok=true`, zero survivors, and no watchdog restarts.
+- Full kernel `izukia/arc-agi3-flash-next-mtp-full/1` completed from
+  `build/kaggle-flash-full-20260911`. Its notebook SHA-256 is
+  `6a141753f142ed0d683f34f9acb1ac732a6e333a193b2ad8612d66125e64d9d1`.
+  It retained the original 25-game order, 7,920 seconds per game,
+  concurrency 28, and nine-hour target budget. The strict offline audit passed
+  with 25/25 games, 4,683 actions, clean teardown, and zero watchdog restarts.
+
+Commands for the full-run gate (use a fresh download directory):
+
+```bash
+uvx --from kaggle kaggle kernels status izukia/arc-agi3-flash-next-mtp-full/1
+uvx --from kaggle kaggle kernels output izukia/arc-agi3-flash-next-mtp-full/1 \
+  -p build/kaggle-output/flash-full-v1
+uvx --with pyarrow --from kaggle python scripts/audit_flash_output.py \
+  --mode full-offline build/kaggle-output/flash-full-v1
+```
+
+The exact version was submitted only after completion, offline audit, and score
+review. The command used was:
+
+```bash
+uvx --from kaggle kaggle competitions submit arc-prize-2026-arc-agi-3 \
+  -k izukia/arc-agi3-flash-next-mtp-full -v 1 -f submission.parquet \
+  -m "Flash-Next MTP; audited public25; GPU-release teardown fix"
+```
+
+Do not submit the local offline placeholder as predictions. Offline mean and
+public leaderboard score are different measurements. The public stack's fast
+setup verifies model/runtime identity metadata, not every payload hash; the
+Flash audit reports this limitation rather than claiming full verification.
+
+The next measured experiment is a one-game preflight with Duck concurrency
+below 28 (for example 8, 12, or 16) to test the observed KV-cache pressure
+against the vLLM eight-sequence limit. Keep the 3.40 submission as the
+incumbent until a variant improves both timeout behavior and score, then run a
+fresh full audit before submitting anything else.
+
+Local checks: `python -m unittest discover -s tests -v`. Teardown behavior tests
+require the downloaded pinned source under `build/flash-teardown-source`
+(the download command is in `tests/test_flash_teardown.py`); otherwise those
+fixture-dependent tests explicitly skip. Parquet auditing uses PyArrow in an
+isolated `uvx` environment, not a new global or project dependency.

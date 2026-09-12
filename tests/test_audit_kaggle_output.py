@@ -56,6 +56,7 @@ def _manifest(game_ids: list[str], *, submission: bool = False) -> dict:
             "reasoning_effort": AUDITOR.MODEL_REASONING_EFFORT,
         },
         "batch_checkpoint_limit": 8,
+        "adapter_fixes": AUDITOR.EXPECTED_ADAPTER_FIXES,
         "expected_dataset_versions": AUDITOR.EXPECTED_DATASET_VERSIONS,
         "TRUE_SUBMISSION": submission,
         "notebook_start_epoch": notebook_start_epoch,
@@ -210,6 +211,25 @@ class AuditKaggleOutputTests(unittest.TestCase):
                     "manifest.model_snapshot.crc_correction_count" in error
                     for error in report["errors"]
                 )
+            )
+
+    def test_adapter_fix_contract_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            game_ids = [min(AUDITOR.EXPECTED_PUBLIC_GAME_IDS)]
+            _write_fixture(root, game_ids)
+            manifest_path = root / "taaf_run_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["adapter_fixes"]["action7_model_label"] = "ACTION7"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+            report = AUDITOR.audit_output(
+                root, mode="preflight", allow_solver_overrides=False
+            )
+
+            self.assertFalse(report["passed"])
+            self.assertTrue(
+                any("manifest.adapter_fixes" in error for error in report["errors"])
             )
 
     def test_crashed_game_fails_even_with_completed_manifest(self) -> None:

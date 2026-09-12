@@ -27,12 +27,14 @@ DOCKER_IMAGE = (
     "57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c"
 )
 EXPECTED_NOTEBOOK_ANCHORS = (
-    'SUBMISSION_VARIANT = "taaf-qwen38-xhigh-checkpoint8"',
+    'SUBMISSION_VARIANT = "taaf-qwen38-xhigh-checkpoint8-undo-sync"',
     'MODEL_HF_REVISION = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"',
     'MODEL_DATASET_REF = "jakobbrggen/qwen3-8-27b-fp8-hf-snapshot"',
     "EXPECTED_SOURCE_TREE_SHA256",
     "EXPECTED_WHEELHOUSE_METADATA_SHA256",
     "EXPECTED_MODEL_FILE_COUNT = 80",
+    'ACTION7_MODEL_LABEL = "UNDO"',
+    "AUTO_RESET_CONTEXT_SYNC = True",
     "_write_submission_health_summary()",
 )
 PACKAGE_MARKER = ".arc-agi-kaggle-package"
@@ -192,7 +194,7 @@ def build_package(args: argparse.Namespace) -> Path:
     _clear_execution_artifacts(notebook)
     compiled_cells = _compile_notebook(notebook, label=f"generated-{args.mode}")
 
-    notebook_name = f"arc-agi3-qwen38-checkpoint8-{args.mode}.ipynb"
+    notebook_name = f"arc-agi3-qwen38-checkpoint8-undo-sync-{args.mode}.ipynb"
     metadata = _metadata(
         kernel_id=args.kernel_id, title=title, notebook_name=notebook_name
     )

@@ -12,7 +12,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-CANDIDATE_VARIANT = "taaf-qwen38-xhigh-checkpoint8"
+CANDIDATE_VARIANT = "taaf-qwen38-xhigh-checkpoint8-undo-sync"
 MODEL_DATASET_REF = "jakobbrggen/qwen3-8-27b-fp8-hf-snapshot"
 MODEL_HF_REF = "Qwen/Qwen3.8-27B-FP8"
 MODEL_HF_REVISION = "017b9c7af6b5689d5dd426a76e0bc077eb5ca20a"
@@ -27,8 +27,12 @@ EXPECTED_SOURCE_TREE = {
     "file_count": 73,
 }
 EXPECTED_PATCHED_TREE = {
-    "sha256": "686d07fe0d69cd73942f14de4c4f0c165b1956009d1eb9bdd439dd4b7b9e5c30",
+    "sha256": "59907e8ed9be64900a760f6ff7da369355d0638bb8bd470f236b6d0b5ab5e0f4",
     "file_count": 73,
+}
+EXPECTED_ADAPTER_FIXES = {
+    "action7_model_label": "UNDO",
+    "auto_reset_context_sync": True,
 }
 EXPECTED_SOLVER_DEFAULTS = {
     "concurrency": 28,
@@ -246,6 +250,12 @@ def _audit_manifest(audit: Audit) -> dict[str, Any] | None:
         "manifest.batch_checkpoint_limit",
         manifest.get("batch_checkpoint_limit"),
         8,
+    )
+    _check_equal(
+        audit,
+        "manifest.adapter_fixes",
+        manifest.get("adapter_fixes"),
+        EXPECTED_ADAPTER_FIXES,
     )
 
     true_submission = manifest.get("TRUE_SUBMISSION")
