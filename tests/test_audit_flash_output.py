@@ -27,8 +27,11 @@ class FlashAuditTests(unittest.TestCase):
         edit(doc)
         self.write(name, doc)
 
-    def fixture(self, full=False):
-        ids = list(AUDIT.PUBLIC_IDS if full else AUDIT.PUBLIC_IDS[:1])
+    def fixture(self, full=False, game_count=None, concurrency=28, game_id=None,
+                runtime_seconds=None, deadline_origin=None):
+        count = len(AUDIT.PUBLIC_IDS) if full else (game_count or 1)
+        ids = [game_id] if game_id is not None else list(AUDIT.PUBLIC_IDS[:count])
+        runtime_seconds = runtime_seconds or (7920 if full else 1800)
         self.write('score.json', {
             'score': 1.0, 'games': {g: {'score': 1.0} for g in ids},
             'metadata': {'scoring_version': 'taaf-framework-score-v1', 'game_ids': ids,
@@ -79,12 +82,29 @@ class FlashAuditTests(unittest.TestCase):
             'game_runs': [{'game_id': g, 'state': 'gave_up', 'final_score': 1.0,
                            'history': [{}], 'final_wallclock_seconds': 50.0} for g in ids]})
         suffix = 'full' if full else 'preflight'
+        deadline = (
+            f'PUBLIC25_DEADLINE origin={deadline_origin} '
+            f'gameplay_budget_s={runtime_seconds}.0\n'
+            if deadline_origin is not None else ''
+        )
         self.write(f'arc-agi3-flash-next-mtp-{suffix}.log', [{'data':
-            f'PUBLIC25_SETTINGS budget_s={7920 if full else 1800}.0 concurrency=28 analyzer_timeout=900.0\n'
-            f'PUBLIC25_AUDIT runs={len(ids)} actions=25\n'}])
+            f'PUBLIC25_SETTINGS budget_s={runtime_seconds}.0 concurrency={concurrency} analyzer_timeout=900.0\n'
+            f'{deadline}PUBLIC25_AUDIT runs={len(ids)} actions=25\n'}])
 
-    def run_audit(self, full=False):
-        return AUDIT.audit(self.root, 'full-offline' if full else 'preflight', check_parquet=False)
+    def run_audit(self, full=False, expected_games=None, expected_concurrency=None,
+                  expected_game_id=None, expected_runtime_seconds=None,
+                  require_clean=False, require_runtime_from_ready=False):
+        return AUDIT.audit(
+            self.root,
+            'full-offline' if full else 'preflight',
+            check_parquet=False,
+            expected_games=expected_games,
+            expected_concurrency=expected_concurrency,
+            expected_game_id=expected_game_id,
+            expected_runtime_seconds=expected_runtime_seconds,
+            require_clean=require_clean,
+            require_runtime_from_ready=require_runtime_from_ready,
+        )
 
     def test_valid_preflight(self):
         self.fixture()
@@ -93,6 +113,80 @@ class FlashAuditTests(unittest.TestCase):
     def test_valid_full(self):
         self.fixture(full=True)
         self.assertEqual(self.run_audit(full=True)['game_count'], 25)
+
+    def test_custom_preflight_settings_are_checked(self):
+        self.fixture(game_count=8, concurrency=8)
+        (self.root / 'arc-agi3-flash-next-mtp-preflight.log').rename(
+            self.root / 'arc-agi3-flash-next-mtp-preflight-c8.log'
+        )
+        report = self.run_audit(expected_games=8, expected_concurrency=8)
+        self.assertEqual(report['game_count'], 8)
+        self.assertEqual(report['expected_concurrency'], 8)
+        self.assertEqual(report['kernel_log'], 'arc-agi3-flash-next-mtp-preflight-c8.log')
+
+    def test_variant_before_mode_log_is_selected(self):
+        self.fixture(full=True, concurrency=8)
+        (self.root / 'arc-agi3-flash-next-mtp-full.log').rename(
+            self.root / 'arc-agi3-flash-next-mtp-c8-full.log'
+        )
+        report = self.run_audit(full=True, expected_concurrency=8)
+        self.assertEqual(report['kernel_log'], 'arc-agi3-flash-next-mtp-c8-full.log')
+
+    def test_custom_preflight_concurrency_mismatch_rejected(self):
+        self.fixture(game_count=8, concurrency=28)
+        with self.assertRaisesRegex(ValueError, 'runtime configuration mismatch'):
+            self.run_audit(expected_games=8, expected_concurrency=8)
+
+    def test_isolated_nonfirst_game_requires_clean_post_setup_run(self):
+        self.fixture(
+            concurrency=8,
+            game_id='tr87-cd924810',
+            runtime_seconds=7920,
+            deadline_origin='post_setup',
+        )
+        report = self.run_audit(
+            expected_games=1,
+            expected_game_id='tr87-cd924810',
+            expected_concurrency=8,
+            expected_runtime_seconds=7920,
+            require_clean=True,
+            require_runtime_from_ready=True,
+        )
+        self.assertEqual(report['expected_game_id'], 'tr87-cd924810')
+        self.assertTrue(report['require_clean'])
+
+    def test_clean_isolated_preflight_rejects_cancellation(self):
+        self.fixture(
+            concurrency=8,
+            game_id='tr87-cd924810',
+            runtime_seconds=7920,
+            deadline_origin='post_setup',
+        )
+        self.change('benchmark.json', lambda d: d['game_runs'][0].update(state='cancelled'))
+        with self.assertRaisesRegex(ValueError, 'cancelled'):
+            self.run_audit(
+                expected_game_id='tr87-cd924810',
+                expected_concurrency=8,
+                expected_runtime_seconds=7920,
+                require_clean=True,
+                require_runtime_from_ready=True,
+            )
+
+    def test_ambiguous_kernel_logs_rejected(self):
+        self.fixture()
+        (self.root / 'arc-agi3-flash-next-mtp-preflight-copy.log').write_text('[]')
+        with self.assertRaisesRegex(ValueError, 'exactly one'):
+            self.run_audit()
+
+    def test_full_audit_accepts_custom_concurrency(self):
+        self.fixture(full=True, concurrency=8)
+        report = self.run_audit(full=True, expected_concurrency=8)
+        self.assertEqual(report['expected_concurrency'], 8)
+
+    def test_full_audit_rejects_custom_game_count(self):
+        self.fixture(full=True)
+        with self.assertRaisesRegex(ValueError, 'full-offline audit requires'):
+            self.run_audit(full=True, expected_games=8, expected_concurrency=8)
 
     def test_full_rejects_cancelled_game(self):
         self.fixture(full=True)

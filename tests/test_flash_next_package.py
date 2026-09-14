@@ -80,6 +80,79 @@ class FlashCoverageTests(unittest.TestCase):
         )
         self.assertIn("bm.solver.max_runtime_s_per_game = 7920.0", full_source)
 
+    def test_custom_preflight_settings_are_embedded_and_full_mode_stays_pinned(self):
+        notebook = json.loads(BUILDER.SOURCE_NOTEBOOK.read_text())
+        BUILDER._add_preflight_support(
+            notebook,
+            max_games=1,
+            concurrency=8,
+            game_id="tr87-cd924810",
+            runtime_seconds=7920,
+        )
+        source = "\n".join(
+            "".join(c.get("source", [])) for c in notebook["cells"]
+            if c.get("cell_type") == "code"
+        )
+        self.assertIn(
+            'FLASH_OFFLINE_MAX_GAMES = int(os.environ.get("FLASH_OFFLINE_MAX_GAMES", "1"))',
+            source,
+        )
+        self.assertIn(
+            'FLASH_RUNTIME_CONCURRENCY = int(os.environ.get("FLASH_RUNTIME_CONCURRENCY", "8"))',
+            source,
+        )
+        self.assertIn(
+            'FLASH_OFFLINE_GAME_ID = os.environ.get("FLASH_OFFLINE_GAME_ID", "tr87-cd924810").strip()',
+            source,
+        )
+        self.assertIn(
+            'FLASH_OFFLINE_MAX_RUNTIME_S = 0.0 if TRUE_SUBMISSION else float(os.environ.get("FLASH_OFFLINE_MAX_RUNTIME_S", "7920"))',
+            source,
+        )
+        self.assertIn(
+            'PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={budget - 600.0}',
+            source,
+        )
+        self.assertLess(
+            source.index('vllm_watchdog.start_background'),
+            source.index('PUBLIC25_DEADLINE origin=post_setup'),
+        )
+        self.assertIn(
+            "bm.solver.concurrency = (FLASH_RUNTIME_CONCURRENCY if FLASH_RUNTIME_CONCURRENCY > 0",
+            source,
+        )
+        self.assertIn(
+            "not TRUE_SUBMISSION and (FLASH_OFFLINE_MAX_GAMES or FLASH_OFFLINE_GAME_ID)",
+            source,
+        )
+
+        full = json.loads(BUILDER.SOURCE_NOTEBOOK.read_text())
+        BUILDER._add_preflight_support(full, max_games=None, concurrency=8)
+        full_source = "\n".join(
+            "".join(c.get("source", [])) for c in full["cells"]
+            if c.get("cell_type") == "code"
+        )
+        self.assertIn(
+            'FLASH_RUNTIME_CONCURRENCY = int(os.environ.get("FLASH_RUNTIME_CONCURRENCY", "8"))',
+            full_source,
+        )
+        self.assertIn(
+            "bm.solver.concurrency = (FLASH_RUNTIME_CONCURRENCY if FLASH_RUNTIME_CONCURRENCY > 0",
+            full_source,
+        )
+        self.assertNotIn('PUBLIC25_DEADLINE origin=post_setup', full_source)
+
+    def test_preflight_settings_reject_invalid_values(self):
+        notebook = json.loads(BUILDER.SOURCE_NOTEBOOK.read_text())
+        with self.assertRaisesRegex(ValueError, "max_games must be at most 25"):
+            BUILDER._add_preflight_support(notebook, max_games=26, concurrency=8)
+        with self.assertRaisesRegex(ValueError, "concurrency must be a positive integer"):
+            BUILDER._add_preflight_support(notebook, max_games=8, concurrency=0)
+        with self.assertRaisesRegex(ValueError, "pinned public game IDs"):
+            BUILDER._add_preflight_support(notebook, max_games=1, game_id="not-a-game")
+        with self.assertRaisesRegex(ValueError, "exactly one game"):
+            BUILDER._add_preflight_support(notebook, max_games=2, game_id="tr87-cd924810")
+
     def test_real_submission_leaves_deadline_to_kaggle_gateway(self):
         notebook = json.loads(BUILDER.SOURCE_NOTEBOOK.read_text())
         BUILDER._add_preflight_support(notebook, max_games=None)

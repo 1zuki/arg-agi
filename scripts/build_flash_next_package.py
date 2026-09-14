@@ -29,6 +29,16 @@ DOCKER_IMAGE = (
     "57e612b484cf3df5026ee4dcc3cb176974b22b2bc0937fb1e16132a8be4cb13c"
 )
 VARIANT = "taaf-qwen38-flash-next-mtp"
+PUBLIC_GAME_COUNT = 25
+PUBLIC_GAME_IDS = (
+    "tn36-ef4dde99", "lf52-271a04aa", "cn04-2fe56bfb", "bp35-0a0ad940",
+    "wa30-ee6fef47", "lp85-305b61c3", "r11l-495a7899", "tu93-0768757b",
+    "sp80-589a99af", "m0r0-492f87ba", "vc33-5430563c", "ar25-0c556536",
+    "ka59-38d34dbb", "sc25-635fd71a", "sk48-d8078629", "dc22-fdcac232",
+    "cd82-fb555c5d", "ft09-0d8bbf25", "g50t-5849a774", "ls20-9607627b",
+    "re86-8af5384d", "s5i5-18d95033", "sb26-7fbdac44", "su15-1944f8ab",
+    "tr87-cd924810",
+)
 
 
 def _slugify(value: str) -> str:
@@ -72,11 +82,37 @@ def _replace_once(text: str, old: str, new: str, label: str) -> str:
     return text.replace(old, new)
 
 
-def _add_preflight_support(notebook: dict, *, max_games: int | None) -> None:
+def _validate_preflight_setting(value: int | None, *, name: str, maximum: int | None = None) -> None:
+    if value is None:
+        return
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer.")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{name} must be at most {maximum}.")
+
+
+def _add_preflight_support(
+    notebook: dict,
+    *,
+    max_games: int | None,
+    concurrency: int | None = None,
+    game_id: str | None = None,
+    runtime_seconds: int | None = None,
+) -> None:
+    _validate_preflight_setting(max_games, name="max_games", maximum=PUBLIC_GAME_COUNT)
+    _validate_preflight_setting(concurrency, name="concurrency")
+    _validate_preflight_setting(runtime_seconds, name="runtime_seconds")
+    if game_id is not None and game_id not in PUBLIC_GAME_IDS:
+        raise ValueError(f"game_id must be one of the pinned public game IDs: {game_id!r}.")
+    if game_id is not None and max_games not in (None, 1):
+        raise ValueError("game_id preflights must select exactly one game.")
+
     start_anchor = "NOTEBOOK_START_EPOCH = time.time()\n"
     start_injection = (
         "\n"
         "FLASH_OFFLINE_MAX_GAMES = int(os.environ.get(\"FLASH_OFFLINE_MAX_GAMES\", \"0\"))\n"
+        "FLASH_OFFLINE_GAME_ID = os.environ.get(\"FLASH_OFFLINE_GAME_ID\", \"\").strip()\n"
+        "FLASH_RUNTIME_CONCURRENCY = int(os.environ.get(\"FLASH_RUNTIME_CONCURRENCY\", \"0\"))\n"
         "FLASH_OFFLINE_MAX_RUNTIME_S = float(os.environ.get(\"FLASH_OFFLINE_MAX_RUNTIME_S\", \"0\"))\n"
     )
     matches = 0
@@ -94,7 +130,12 @@ def _add_preflight_support(notebook: dict, *, max_games: int | None) -> None:
     list_anchor = "])\n\nif TRUE_SUBMISSION:\n"
     list_injection = (
         "])\n\n"
-        "if not TRUE_SUBMISSION and FLASH_OFFLINE_MAX_GAMES:\n"
+        "if not TRUE_SUBMISSION and FLASH_OFFLINE_GAME_ID:\n"
+        "    if FLASH_OFFLINE_GAME_ID not in PUBLIC_GAME_IDS:\n"
+        "        raise RuntimeError(f'Unknown offline game ID: {FLASH_OFFLINE_GAME_ID!r}.')\n"
+        "    PUBLIC_GAME_IDS = tuple(game_id for game_id in PUBLIC_GAME_IDS\n"
+        "                            if game_id == FLASH_OFFLINE_GAME_ID)\n\n"
+        "elif not TRUE_SUBMISSION and FLASH_OFFLINE_MAX_GAMES:\n"
         "    PUBLIC_GAME_IDS = PUBLIC_GAME_IDS[:FLASH_OFFLINE_MAX_GAMES]\n\n"
         "if TRUE_SUBMISSION:\n"
     )
@@ -123,7 +164,7 @@ def _add_preflight_support(notebook: dict, *, max_games: int | None) -> None:
         if extra_check in source:
             source = source.replace(
                 extra_check,
-                "    extra = [] if (not TRUE_SUBMISSION and FLASH_OFFLINE_MAX_GAMES) else sorted(set(offline_by_id) - set(PUBLIC_GAME_IDS))\n",
+                "    extra = [] if (not TRUE_SUBMISSION and (FLASH_OFFLINE_MAX_GAMES or FLASH_OFFLINE_GAME_ID)) else sorted(set(offline_by_id) - set(PUBLIC_GAME_IDS))\n",
                 1,
             )
         cell["source"] = source.splitlines(keepends=True)
@@ -196,7 +237,7 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
     if setup_matches != 1:
         raise ValueError(f"Flash setup anchor matched {setup_matches} times; expected once.")
 
-    if max_games is not None:
+    if max_games is not None or runtime_seconds is not None:
         cell = next(
             cell
             for cell in notebook["cells"]
@@ -204,16 +245,23 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
             and "FLASH_OFFLINE_MAX_GAMES" in "".join(cell.get("source", []))
         )
         source = "".join(cell["source"])
+        runtime_default = 1800 if runtime_seconds is None else runtime_seconds
         source = source.replace(
             'FLASH_OFFLINE_MAX_GAMES = int(os.environ.get("FLASH_OFFLINE_MAX_GAMES", "0"))',
-            f'FLASH_OFFLINE_MAX_GAMES = int(os.environ.get("FLASH_OFFLINE_MAX_GAMES", "{max_games}"))',
+            f'FLASH_OFFLINE_MAX_GAMES = int(os.environ.get("FLASH_OFFLINE_MAX_GAMES", "{max_games or 0}"))',
             1,
         )
         source = source.replace(
             'FLASH_OFFLINE_MAX_RUNTIME_S = float(os.environ.get("FLASH_OFFLINE_MAX_RUNTIME_S", "0"))',
-            'FLASH_OFFLINE_MAX_RUNTIME_S = 0.0 if TRUE_SUBMISSION else float(os.environ.get("FLASH_OFFLINE_MAX_RUNTIME_S", "1800"))',
+            f'FLASH_OFFLINE_MAX_RUNTIME_S = 0.0 if TRUE_SUBMISSION else float(os.environ.get("FLASH_OFFLINE_MAX_RUNTIME_S", "{runtime_default}"))',
             1,
         )
+        if game_id is not None:
+            source = source.replace(
+                'FLASH_OFFLINE_GAME_ID = os.environ.get("FLASH_OFFLINE_GAME_ID", "").strip()',
+                f'FLASH_OFFLINE_GAME_ID = os.environ.get("FLASH_OFFLINE_GAME_ID", "{game_id}").strip()',
+                1,
+            )
         cell["source"] = source.splitlines(keepends=True)
 
         settings_anchor = "bm.solver.max_runtime_s_per_game = 7920.0"
@@ -246,6 +294,78 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
                 f"settings={replaced_settings}, budget={replaced_budget}."
             )
 
+        deadline_anchor = """    ),
+)
+
+# Play the benchmark; watchdog stop and teardown run even if it raises.
+"""
+        deadline_replacement = """    ),
+)
+
+# Isolated diagnostics measure gameplay after serving setup, rather than charging
+# model loading time against the requested per-game runtime.
+if not TRUE_SUBMISSION and FLASH_OFFLINE_GAME_ID and FLASH_OFFLINE_MAX_RUNTIME_S > 0:
+    soft_end = datetime.now() + timedelta(seconds=budget - 600.0)
+    print(
+        f\"PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={budget - 600.0}\",
+        flush=True,
+    )
+elif not TRUE_SUBMISSION:
+    print(
+        f\"PUBLIC25_DEADLINE origin=notebook_start gameplay_budget_s={budget - 600.0}\",
+        flush=True,
+    )
+
+# Play the benchmark; watchdog stop and teardown run even if it raises.
+"""
+        deadline_matches = 0
+        for candidate in notebook["cells"]:
+            if candidate.get("cell_type") != "code":
+                continue
+            candidate_source = "".join(candidate.get("source", []))
+            deadline_matches += candidate_source.count(deadline_anchor)
+            candidate_source = candidate_source.replace(deadline_anchor, deadline_replacement)
+            candidate["source"] = candidate_source.splitlines(keepends=True)
+        if deadline_matches != 1:
+            raise ValueError(
+                "Flash preflight deadline anchor did not match exactly once: "
+                f"deadline={deadline_matches}."
+            )
+
+    if concurrency is not None:
+        concurrency_anchor = "bm.solver.concurrency = 28"
+        replaced_concurrency = 0
+        for candidate in notebook["cells"]:
+            if candidate.get("cell_type") != "code":
+                continue
+            candidate_source = "".join(candidate.get("source", []))
+            if concurrency_anchor in candidate_source:
+                replaced_concurrency += candidate_source.count(concurrency_anchor)
+                candidate_source = candidate_source.replace(
+                    concurrency_anchor,
+                    "bm.solver.concurrency = (FLASH_RUNTIME_CONCURRENCY "
+                    "if FLASH_RUNTIME_CONCURRENCY > 0 else 28)",
+                )
+            candidate["source"] = candidate_source.splitlines(keepends=True)
+        if replaced_concurrency != 1:
+            raise ValueError(
+                "Flash runtime concurrency anchor did not match exactly once: "
+                f"concurrency={replaced_concurrency}."
+            )
+        cell = next(
+            cell
+            for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+            and "FLASH_RUNTIME_CONCURRENCY" in "".join(cell.get("source", []))
+        )
+        source = "".join(cell["source"])
+        source = source.replace(
+            'FLASH_RUNTIME_CONCURRENCY = int(os.environ.get("FLASH_RUNTIME_CONCURRENCY", "0"))',
+            f'FLASH_RUNTIME_CONCURRENCY = int(os.environ.get("FLASH_RUNTIME_CONCURRENCY", "{concurrency}"))',
+            1,
+        )
+        cell["source"] = source.splitlines(keepends=True)
+
 
 def _metadata(kernel_id: str, notebook_name: str, title: str) -> dict:
     _parse_kernel_id(kernel_id)
@@ -275,7 +395,25 @@ def build(args: argparse.Namespace) -> Path:
     if not SOURCE_NOTEBOOK.is_file():
         raise FileNotFoundError(SOURCE_NOTEBOOK)
     notebook = json.loads(SOURCE_NOTEBOOK.read_text(encoding="utf-8"))
-    _add_preflight_support(notebook, max_games=1 if args.mode == "preflight" else None)
+    if args.mode == "full" and any(
+        value is not None for value in (args.max_games, args.game_id, args.runtime_seconds)
+    ):
+        raise ValueError("--max-games, --game-id, and --runtime-seconds are only valid for preflight packages.")
+    if args.game_id is not None and args.max_games not in (None, 1):
+        raise ValueError("--game-id can only be combined with --max-games 1.")
+    max_games = 1 if args.mode == "preflight" and args.max_games is None else args.max_games
+    concurrency = 28 if args.mode == "preflight" and args.concurrency is None else args.concurrency
+    runtime_seconds = (
+        1800 if args.mode == "preflight" and args.runtime_seconds is None
+        else args.runtime_seconds
+    )
+    _add_preflight_support(
+        notebook,
+        max_games=max_games,
+        concurrency=concurrency,
+        game_id=args.game_id,
+        runtime_seconds=runtime_seconds,
+    )
     _clean_execution(notebook)
     notebook_name = f"arc-agi3-qwen38-flash-next-mtp-{args.mode}.ipynb"
     title = args.title or _parse_kernel_id(args.kernel_id)[1].replace("-", " ")
@@ -309,6 +447,25 @@ def main() -> None:
     parser.add_argument("--mode", choices=("preflight", "full"), default="preflight")
     parser.add_argument("--title")
     parser.add_argument("--output-dir", type=Path)
+    parser.add_argument(
+        "--max-games",
+        type=int,
+        help="Preflight offline game limit (default: 1; full packages always use all 25 games).",
+    )
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        help="Measured Duck concurrency override (preflight and full; default: 28).",
+    )
+    parser.add_argument(
+        "--game-id",
+        help="Run one pinned offline public game (preflight only).",
+    )
+    parser.add_argument(
+        "--runtime-seconds",
+        type=int,
+        help="Per-game offline runtime for an isolated preflight (default: 1800).",
+    )
     build(parser.parse_args())
 
 

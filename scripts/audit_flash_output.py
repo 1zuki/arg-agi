@@ -54,9 +54,46 @@ def digest(root: Path, name: str) -> str:
     return hashlib.sha256(read(root, name)).hexdigest()
 
 
-def audit(root: Path, mode: str, *, check_parquet: bool = True) -> dict:
+def audit(
+    root: Path,
+    mode: str,
+    *,
+    check_parquet: bool = True,
+    expected_games: int | None = None,
+    expected_concurrency: int | None = None,
+    expected_game_id: str | None = None,
+    expected_runtime_seconds: int | None = None,
+    require_clean: bool = False,
+    require_runtime_from_ready: bool = False,
+) -> dict:
     require(mode in ('preflight', 'full-offline'), 'unsupported audit mode')
-    expected_ids = list(PUBLIC_IDS[:1] if mode == 'preflight' else PUBLIC_IDS)
+    default_games = 1 if mode == 'preflight' else len(PUBLIC_IDS)
+    expected_games = default_games if expected_games is None else expected_games
+    expected_concurrency = 28 if expected_concurrency is None else expected_concurrency
+    default_runtime_seconds = 1800 if mode == 'preflight' else 7920
+    expected_runtime_seconds = (
+        default_runtime_seconds if expected_runtime_seconds is None else expected_runtime_seconds
+    )
+    require(type(expected_games) is int and 1 <= expected_games <= len(PUBLIC_IDS),
+            'invalid expected game count')
+    require(type(expected_concurrency) is int and expected_concurrency >= 1,
+            'invalid expected concurrency')
+    require(type(expected_runtime_seconds) is int and expected_runtime_seconds >= 1,
+            'invalid expected runtime seconds')
+    require(mode == 'preflight' or expected_games == len(PUBLIC_IDS),
+            'full-offline audit requires 25 games')
+    require(expected_game_id is None or mode == 'preflight',
+            'expected game ID is only valid for preflight')
+    require(expected_game_id is None or expected_game_id in PUBLIC_IDS,
+            'expected game ID is not pinned')
+    require(expected_game_id is None or expected_games == 1,
+            'expected game ID requires one expected game')
+    require(not require_runtime_from_ready or expected_game_id is not None,
+            'runtime-from-ready requires an expected game ID')
+    expected_ids = (
+        [expected_game_id] if expected_game_id is not None
+        else list(PUBLIC_IDS[:expected_games] if mode == 'preflight' else PUBLIC_IDS)
+    )
     td = document(root, 'vllm-server-teardown.json')
     for key in ('shutdown_ok', 'identity_valid', 'working_dir_validated',
                 'port_closed', 'final_metrics_preserved', 'required_artifacts_preserved'):
@@ -113,7 +150,9 @@ def audit(root: Path, mode: str, *, check_parquet: bool = True) -> dict:
     runs = bm['game_runs']
     ids = [r['game_id'] for r in runs]
     require(ids == expected_ids, 'incorrect game coverage or order')
-    states = {'won', 'gave_up', 'cancelled'} if mode == 'preflight' else {'won', 'gave_up'}
+    states = {'won', 'gave_up'} if require_clean or mode == 'full-offline' else {
+        'won', 'gave_up', 'cancelled'
+    }
     for run in runs:
         require(run.get('state') in states, 'crashed, cancelled, or unfinished run')
         require(finite(run.get('final_score')) and run['final_score'] >= 0, 'invalid final score')
@@ -135,11 +174,28 @@ def audit(root: Path, mode: str, *, check_parquet: bool = True) -> dict:
         require(table.column_names == ['row_id', 'game_id', 'end_of_game', 'score'], 'parquet columns')
         require(table.to_pylist() == [{'row_id': '1_0', 'game_id': '1', 'end_of_game': True, 'score': 1}],
                 'incorrect offline placeholder')
-    log = json.loads(read(root, 'arc-agi3-flash-next-mtp-' + ('preflight' if mode == 'preflight' else 'full') + '.log'))
+    log_mode = 'preflight' if mode == 'preflight' else 'full'
+    log_prefix = 'arc-agi3-flash-next-mtp-'
+    log_names = sorted(
+        path.name
+        for path in root.iterdir()
+        if path.is_file()
+        and not path.is_symlink()
+        and path.name.startswith(log_prefix)
+        and path.suffix == '.log'
+        and log_mode in path.stem[len(log_prefix):].split('-')
+    )
+    require(len(log_names) == 1, 'expected exactly one mode-matching kernel log')
+    log = json.loads(read(root, log_names[0]))
     text = ''.join(row.get('data', '') for row in log)
-    budget = 1800 if mode == 'preflight' else 7920
-    require(f'PUBLIC25_SETTINGS budget_s={budget}.0 concurrency=28 analyzer_timeout=900.0' in text,
+    require(f'PUBLIC25_SETTINGS budget_s={expected_runtime_seconds}.0 concurrency={expected_concurrency} '
+            'analyzer_timeout=900.0' in text,
             'runtime configuration mismatch')
+    if require_runtime_from_ready:
+        require(
+            f'PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={expected_runtime_seconds}.0' in text,
+            'runtime deadline did not start after setup',
+        )
     require(f'PUBLIC25_AUDIT runs={len(ids)} actions=' in text, 'offline audit log missing')
     require('Traceback (most recent call last)' not in text, 'Python traceback in kernel log')
     warnings = ['Offline placeholder is not a scored submission; kernel completion must be checked separately.']
@@ -147,7 +203,12 @@ def audit(root: Path, mode: str, *, check_parquet: bool = True) -> dict:
         warnings.append('Fast setup checks identity, not all model/runtime payload hashes.')
     if any(r['state'] == 'cancelled' for r in runs):
         warnings.append('Preflight deadline cancellation accepted only for the runtime smoke test.')
-    return {'passed': True, 'mode': mode, 'game_count': len(runs), 'offline_mean': mean,
+    return {'passed': True, 'mode': mode, 'kernel_log': log_names[0], 'game_count': len(runs),
+            'expected_game_id': expected_game_id,
+            'expected_concurrency': expected_concurrency,
+            'expected_runtime_seconds': expected_runtime_seconds,
+            'require_clean': require_clean,
+            'offline_mean': mean,
             'total_actions': sum(len(r['history']) for r in runs),
             'watchdog_restarts': watchdog['restart_attempts'], 'parquet_checked': check_parquet,
             'shutdown_ok': True, 'warnings': warnings}
@@ -157,9 +218,27 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output_dir', type=Path)
     parser.add_argument('--mode', choices=('preflight', 'full-offline'), required=True)
+    parser.add_argument('--expected-games', type=int,
+                        help='Expected preflight game count (default: 1).')
+    parser.add_argument('--expected-concurrency', type=int,
+                        help='Expected preflight Duck concurrency (default: 28).')
+    parser.add_argument('--expected-game-id',
+                        help='Pinned single-game preflight ID to require.')
+    parser.add_argument('--expected-runtime-seconds', type=int,
+                        help='Expected per-game runtime (default: 1800 preflight, 7920 full).')
+    parser.add_argument('--require-clean', action='store_true',
+                        help='Reject cancelled games, including in preflight mode.')
+    parser.add_argument('--require-runtime-from-ready', action='store_true',
+                        help='Require an isolated preflight deadline to start after setup.')
     args = parser.parse_args()
     try:
-        report = audit(args.output_dir, args.mode)
+        report = audit(args.output_dir, args.mode,
+                       expected_games=args.expected_games,
+                       expected_concurrency=args.expected_concurrency,
+                       expected_game_id=args.expected_game_id,
+                       expected_runtime_seconds=args.expected_runtime_seconds,
+                       require_clean=args.require_clean,
+                       require_runtime_from_ready=args.require_runtime_from_ready)
     except (ValueError, KeyError, TypeError, IndexError, OSError, ImportError) as error:
         # Avoid echoing logs or arbitrary data from downloaded artifacts.
         print(json.dumps({'passed': False, 'error_type': type(error).__name__}))
