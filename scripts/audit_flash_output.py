@@ -19,6 +19,11 @@ PUBLIC_IDS = (
 )
 SOURCE_HASH = 'c48368e330abf2574b155b42041bd5d42ea556d53340ccbbc5c8788acaa0eb19'
 PATCH_HASH = '5224fe6f6a3f8d4def01954a4a0de355a6746bc4cc289c082a0e07ac0efef725'
+AGENT_PATCH_NAME = 'reasoning-world-model-v1'
+AGENT_SOURCE_HASH = '535ee88b81b262fa5aedb785466ade9f3183a6417656fb6733427242baac7c9d'
+AGENT_PATCH_HASH = '978026a51c438744c64922571b2264f09a3d4ec4259ddc75b03ccc0f3ba0b772'
+AGENT_OVERLAY_PATH = 'flash_agent_overlay/inference/agent/tool_agent.py'
+MAX_TERMINAL_GRACE_SECONDS = 599
 SERVED_MODEL = 'Qwen/Qwen3.8-Flash-Next-NVFP4'
 TUNING = {
     'enable_chunked_prefill': True, 'enable_prefix_caching': False,
@@ -54,6 +59,18 @@ def digest(root: Path, name: str) -> str:
     return hashlib.sha256(read(root, name)).hexdigest()
 
 
+def log_json_records(text: str, marker: str) -> list[dict]:
+    records: list[dict] = []
+    prefix = f'{marker} '
+    for line in text.splitlines():
+        if not line.startswith(prefix):
+            continue
+        record = json.loads(line[len(prefix):])
+        require(isinstance(record, dict), f'{marker}: expected JSON object')
+        records.append(record)
+    return records
+
+
 def audit(
     root: Path,
     mode: str,
@@ -65,6 +82,11 @@ def audit(
     expected_runtime_seconds: int | None = None,
     require_clean: bool = False,
     require_runtime_from_ready: bool = False,
+    expected_terminal_grace_seconds: int | None = None,
+    require_agent_state_patch: bool = False,
+    expected_analyzer_timeout: int = 900,
+    kernel_log: str | None = None,
+    expected_gameplay_budget_seconds: int | None = None,
 ) -> dict:
     require(mode in ('preflight', 'full-offline'), 'unsupported audit mode')
     default_games = 1 if mode == 'preflight' else len(PUBLIC_IDS)
@@ -74,12 +96,26 @@ def audit(
     expected_runtime_seconds = (
         default_runtime_seconds if expected_runtime_seconds is None else expected_runtime_seconds
     )
+    expected_gameplay_budget_seconds = (
+        expected_runtime_seconds
+        if expected_gameplay_budget_seconds is None
+        else expected_gameplay_budget_seconds
+    )
     require(type(expected_games) is int and 1 <= expected_games <= len(PUBLIC_IDS),
             'invalid expected game count')
     require(type(expected_concurrency) is int and expected_concurrency >= 1,
             'invalid expected concurrency')
     require(type(expected_runtime_seconds) is int and expected_runtime_seconds >= 1,
             'invalid expected runtime seconds')
+    require(type(expected_gameplay_budget_seconds) is int and expected_gameplay_budget_seconds >= 1,
+            'invalid expected gameplay budget seconds')
+    require(type(expected_analyzer_timeout) is int and expected_analyzer_timeout >= 1,
+            'invalid expected analyzer timeout')
+    require(expected_terminal_grace_seconds is None or (
+        mode == 'preflight'
+        and type(expected_terminal_grace_seconds) is int
+        and 0 <= expected_terminal_grace_seconds <= MAX_TERMINAL_GRACE_SECONDS
+    ), 'invalid expected terminal grace seconds')
     require(mode == 'preflight' or expected_games == len(PUBLIC_IDS),
             'full-offline audit requires 25 games')
     require(expected_game_id is None or mode == 'preflight',
@@ -121,6 +157,17 @@ def audit(
     require(patch == {'patch': 'gpu-release-settle-v1', 'source_sha256': SOURCE_HASH,
                       'patched_sha256': PATCH_HASH}, 'teardown patch identity mismatch')
     require(digest(root, 'flash_serving_teardown.py') == PATCH_HASH, 'patched source changed')
+    expected_agent_patch = {
+        'patch': AGENT_PATCH_NAME,
+        'source_sha256': AGENT_SOURCE_HASH,
+        'patched_sha256': AGENT_PATCH_HASH,
+        'overlay_tool_agent_sha256': AGENT_PATCH_HASH,
+    }
+    if require_agent_state_patch:
+        require(document(root, 'flash_agent_state_patch.json') == expected_agent_patch,
+                'agent state patch identity mismatch')
+        require(digest(root, AGENT_OVERLAY_PATH) == AGENT_PATCH_HASH,
+                'agent state overlay source changed')
     provenance = document(root, 'vllm-setup-provenance.json')
     expected = {
         'model_hf_repo': 'RadixArk/Qwen3.8-Flash-Next-NVFP4',
@@ -185,17 +232,46 @@ def audit(
         and path.suffix == '.log'
         and log_mode in path.stem[len(log_prefix):].split('-')
     )
+    if kernel_log is not None:
+        require(isinstance(kernel_log, str) and Path(kernel_log).name == kernel_log
+                and kernel_log.startswith(log_prefix) and kernel_log.endswith('.log'),
+                'invalid explicit kernel log name')
+        log_names = [kernel_log]
     require(len(log_names) == 1, 'expected exactly one mode-matching kernel log')
     log = json.loads(read(root, log_names[0]))
     text = ''.join(row.get('data', '') for row in log)
     require(f'PUBLIC25_SETTINGS budget_s={expected_runtime_seconds}.0 concurrency={expected_concurrency} '
-            'analyzer_timeout=900.0' in text,
+            f'analyzer_timeout={float(expected_analyzer_timeout)}' in text,
             'runtime configuration mismatch')
     if require_runtime_from_ready:
         require(
-            f'PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={expected_runtime_seconds}.0' in text,
+            f'PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={expected_gameplay_budget_seconds}.0' in text,
             'runtime deadline did not start after setup',
         )
+    if expected_terminal_grace_seconds is not None:
+        require(
+            f'PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={expected_gameplay_budget_seconds}.0 '
+            f'terminal_grace_s={float(expected_terminal_grace_seconds)}' in text,
+            'terminal grace configuration mismatch',
+        )
+    if require_agent_state_patch:
+        require(expected_agent_patch in log_json_records(text, 'FLASH_AGENT_STATE_PATCH'),
+                'agent state patch log missing or mismatched')
+        overlay_records = log_json_records(text, 'FLASH_AGENT_OVERLAY_READY')
+        require(any(
+            isinstance(record.get('root'), str)
+            and record.get('tool_agent_sha256') == AGENT_PATCH_HASH
+            for record in overlay_records
+        ), 'agent state overlay log missing or mismatched')
+        require('FLASH_AGENT_OVERLAY_REASSERTED' in text,
+                'agent state overlay was not reasserted after setup')
+        imported_records = log_json_records(text, 'FLASH_AGENT_OVERLAY_IMPORTED')
+        require(any(
+            isinstance(record.get('tool_agent_path'), str)
+            and record['tool_agent_path'].endswith(AGENT_OVERLAY_PATH)
+            and record.get('tool_agent_sha256') == AGENT_PATCH_HASH
+            for record in imported_records
+        ), 'agent state overlay import log missing or mismatched')
     require(f'PUBLIC25_AUDIT runs={len(ids)} actions=' in text, 'offline audit log missing')
     require('Traceback (most recent call last)' not in text, 'Python traceback in kernel log')
     warnings = ['Offline placeholder is not a scored submission; kernel completion must be checked separately.']
@@ -207,6 +283,10 @@ def audit(
             'expected_game_id': expected_game_id,
             'expected_concurrency': expected_concurrency,
             'expected_runtime_seconds': expected_runtime_seconds,
+            'expected_gameplay_budget_seconds': expected_gameplay_budget_seconds,
+            'expected_analyzer_timeout': expected_analyzer_timeout,
+            'expected_terminal_grace_seconds': expected_terminal_grace_seconds,
+            'agent_state_patch_required': require_agent_state_patch,
             'require_clean': require_clean,
             'offline_mean': mean,
             'total_actions': sum(len(r['history']) for r in runs),
@@ -226,10 +306,20 @@ def main() -> int:
                         help='Pinned single-game preflight ID to require.')
     parser.add_argument('--expected-runtime-seconds', type=int,
                         help='Expected per-game runtime (default: 1800 preflight, 7920 full).')
+    parser.add_argument('--expected-gameplay-budget-seconds', type=int,
+                        help='Expected total preflight gameplay budget after scheduling batches.')
     parser.add_argument('--require-clean', action='store_true',
                         help='Reject cancelled games, including in preflight mode.')
     parser.add_argument('--require-runtime-from-ready', action='store_true',
                         help='Require an isolated preflight deadline to start after setup.')
+    parser.add_argument('--expected-terminal-grace-seconds', type=int,
+                        help='Require this bounded post-runtime grace in a preflight log.')
+    parser.add_argument('--expected-analyzer-timeout', type=int, default=900,
+                        help='Expected analyzer request timeout (default: 900).')
+    parser.add_argument('--kernel-log',
+                        help='Exact downloaded kernel log filename when its slug omits the mode.')
+    parser.add_argument('--require-agent-state-patch', action='store_true',
+                        help='Require the digest-bound Flash reasoning-state overlay artifacts and logs.')
     args = parser.parse_args()
     try:
         report = audit(args.output_dir, args.mode,
@@ -237,8 +327,13 @@ def main() -> int:
                        expected_concurrency=args.expected_concurrency,
                        expected_game_id=args.expected_game_id,
                        expected_runtime_seconds=args.expected_runtime_seconds,
+                       expected_gameplay_budget_seconds=args.expected_gameplay_budget_seconds,
                        require_clean=args.require_clean,
-                       require_runtime_from_ready=args.require_runtime_from_ready)
+                       require_runtime_from_ready=args.require_runtime_from_ready,
+                       expected_terminal_grace_seconds=args.expected_terminal_grace_seconds,
+                       require_agent_state_patch=args.require_agent_state_patch,
+                       expected_analyzer_timeout=args.expected_analyzer_timeout,
+                       kernel_log=args.kernel_log)
     except (ValueError, KeyError, TypeError, IndexError, OSError, ImportError) as error:
         # Avoid echoing logs or arbitrary data from downloaded artifacts.
         print(json.dumps({'passed': False, 'error_type': type(error).__name__}))

@@ -39,6 +39,7 @@ PUBLIC_GAME_IDS = (
     "re86-8af5384d", "s5i5-18d95033", "sb26-7fbdac44", "su15-1944f8ab",
     "tr87-cd924810",
 )
+MAX_TERMINAL_GRACE_SECONDS = 599
 
 
 def _slugify(value: str) -> str:
@@ -91,6 +92,16 @@ def _validate_preflight_setting(value: int | None, *, name: str, maximum: int | 
         raise ValueError(f"{name} must be at most {maximum}.")
 
 
+def _validate_terminal_grace_seconds(value: int | None) -> None:
+    if value is None:
+        return
+    if type(value) is not int or not 0 <= value <= MAX_TERMINAL_GRACE_SECONDS:
+        raise ValueError(
+            "terminal_grace_seconds must be an integer from 0 to "
+            f"{MAX_TERMINAL_GRACE_SECONDS}."
+        )
+
+
 def _add_preflight_support(
     notebook: dict,
     *,
@@ -98,10 +109,15 @@ def _add_preflight_support(
     concurrency: int | None = None,
     game_id: str | None = None,
     runtime_seconds: int | None = None,
+    terminal_grace_seconds: int | None = None,
+    analyzer_timeout: int | None = None,
+    include_agent_state_patch: bool = False,
 ) -> None:
     _validate_preflight_setting(max_games, name="max_games", maximum=PUBLIC_GAME_COUNT)
     _validate_preflight_setting(concurrency, name="concurrency")
     _validate_preflight_setting(runtime_seconds, name="runtime_seconds")
+    _validate_preflight_setting(analyzer_timeout, name="analyzer_timeout")
+    _validate_terminal_grace_seconds(terminal_grace_seconds)
     if game_id is not None and game_id not in PUBLIC_GAME_IDS:
         raise ValueError(f"game_id must be one of the pinned public game IDs: {game_id!r}.")
     if game_id is not None and max_games not in (None, 1):
@@ -114,6 +130,8 @@ def _add_preflight_support(
         "FLASH_OFFLINE_GAME_ID = os.environ.get(\"FLASH_OFFLINE_GAME_ID\", \"\").strip()\n"
         "FLASH_RUNTIME_CONCURRENCY = int(os.environ.get(\"FLASH_RUNTIME_CONCURRENCY\", \"0\"))\n"
         "FLASH_OFFLINE_MAX_RUNTIME_S = float(os.environ.get(\"FLASH_OFFLINE_MAX_RUNTIME_S\", \"0\"))\n"
+        "FLASH_TERMINAL_GRACE_S = float(os.environ.get(\"FLASH_TERMINAL_GRACE_S\", \"0\"))\n"
+        "FLASH_ANALYZER_TIMEOUT = float(os.environ.get(\"FLASH_ANALYZER_TIMEOUT\", \"900\"))\n"
     )
     matches = 0
     for cell in notebook["cells"]:
@@ -203,8 +221,12 @@ def _add_preflight_support(
 
     # Stage the verified patch before GPU setup, not after an expensive run.
     setup_anchor = "# Each bundled repo exposes its importable tree at <repo>/src or <repo>.\n"
-    patch_source = (REPO_ROOT / "scripts/flash_teardown_patch.py").read_text(encoding="utf-8")
-    stage_source = patch_source + """
+    teardown_patch_source = (REPO_ROOT / "scripts/flash_teardown_patch.py").read_text(encoding="utf-8")
+    agent_patch_source = (
+        (REPO_ROOT / "scripts/flash_agent_state_patch.py").read_text(encoding="utf-8")
+        if include_agent_state_patch else ""
+    )
+    stage_source = teardown_patch_source + ("\n" + agent_patch_source if agent_patch_source else "") + """
 import hashlib
 
 if json.loads((BUNDLE_DIR / "teardown_commands.json").read_text()) != [
@@ -225,6 +247,43 @@ _teardown_patch_record = {
 )
 print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
 
+""" + ("""
+_agent_source_path = BUNDLE_DIR / "src" / "ARC3-Inference" / "inference" / "agent" / "tool_agent.py"
+if _agent_source_path.is_symlink() or not _agent_source_path.is_file():
+    raise RuntimeError("Flash tool-agent source is missing or a symlink.")
+_agent_original = _agent_source_path.read_bytes()
+_agent_patched = patch_tool_agent(_agent_original)
+FLASH_AGENT_OVERLAY_ROOT = WORKING_DIR / "flash_agent_overlay"
+_agent_overlay = FLASH_AGENT_OVERLAY_ROOT / "inference" / "agent"
+_agent_overlay.mkdir(parents=True, exist_ok=True)
+(FLASH_AGENT_OVERLAY_ROOT / "inference" / "__init__.py").write_text(
+    "from pkgutil import extend_path\\n__path__ = extend_path(__path__, __name__)\\n",
+    encoding="utf-8",
+)
+(_agent_overlay / "__init__.py").write_text(
+    "from pkgutil import extend_path\\n"
+    "__path__ = extend_path(__path__, __name__)\\n"
+    "from inference.agent.tool_agent import ToolAgent\\n"
+    "from inference.agent.runtime_state import Frame, HistoryEntry\\n"
+    "__all__ = [\\\"ToolAgent\\\", \\\"Frame\\\", \\\"HistoryEntry\\\"]\\n",
+    encoding="utf-8",
+)
+_agent_overlay_path = _agent_overlay / "tool_agent.py"
+_agent_overlay_path.write_text(_agent_patched, encoding="utf-8")
+_agent_patch_record = {
+    "patch": PATCH_NAME,
+    "source_sha256": hashlib.sha256(_agent_original).hexdigest(),
+    "patched_sha256": hashlib.sha256(_agent_patched.encode("utf-8")).hexdigest(),
+    "overlay_tool_agent_sha256": hashlib.sha256(_agent_overlay_path.read_bytes()).hexdigest(),
+}
+if _agent_patch_record["patched_sha256"] != _agent_patch_record["overlay_tool_agent_sha256"]:
+    raise RuntimeError("Flash agent-state overlay digest changed while staging.")
+(WORKING_DIR / "flash_agent_state_patch.json").write_text(
+    json.dumps(_agent_patch_record, indent=2) + "\\n", encoding="utf-8"
+)
+print("FLASH_AGENT_STATE_PATCH", json.dumps(_agent_patch_record), flush=True)
+""" if include_agent_state_patch else "") + """
+
 """
     setup_matches = 0
     for candidate in notebook["cells"]:
@@ -236,6 +295,93 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
         candidate["source"] = text.splitlines(keepends=True)
     if setup_matches != 1:
         raise ValueError(f"Flash setup anchor matched {setup_matches} times; expected once.")
+
+    source_path_anchor = "print(f\"taaf.kaggle: wrote {pth_path} ({len(source_entries)} source roots)\")\n"
+    source_path_injection = source_path_anchor + """if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
+    raise RuntimeError("Flash source loaded before the agent-state overlay could be installed.")
+sys.path.insert(0, str(FLASH_AGENT_OVERLAY_ROOT))
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    entry for entry in [str(FLASH_AGENT_OVERLAY_ROOT), os.environ.get("PYTHONPATH", "")]
+    if entry
+)
+print(
+    "FLASH_AGENT_OVERLAY_READY",
+    json.dumps({
+        "root": str(FLASH_AGENT_OVERLAY_ROOT),
+        "tool_agent_sha256": _agent_patch_record["overlay_tool_agent_sha256"],
+    }),
+    flush=True,
+)
+"""
+    if not include_agent_state_patch:
+        source_path_injection = source_path_anchor
+    source_path_matches = 0
+    for candidate in notebook["cells"]:
+        if candidate.get("cell_type") != "code":
+            continue
+        candidate_source = "".join(candidate.get("source", []))
+        source_path_matches += candidate_source.count(source_path_anchor)
+        candidate_source = candidate_source.replace(source_path_anchor, source_path_injection)
+        candidate["source"] = candidate_source.splitlines(keepends=True)
+    if source_path_matches != 1:
+        raise ValueError(
+            "Flash agent-state overlay anchor did not match exactly once: "
+            f"source_path={source_path_matches}."
+        )
+
+    setup_finish_anchor = """for entry in reversed([e for e in os.environ.get("PYTHONPATH", "").split(os.pathsep) if e]):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)"""
+    setup_finish_injection = setup_finish_anchor + """
+
+if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
+    raise RuntimeError("Flash source loaded during setup before the agent-state overlay could be used.")
+if str(FLASH_AGENT_OVERLAY_ROOT) in sys.path:
+    sys.path.remove(str(FLASH_AGENT_OVERLAY_ROOT))
+sys.path.insert(0, str(FLASH_AGENT_OVERLAY_ROOT))
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    entry for entry in [
+        str(FLASH_AGENT_OVERLAY_ROOT),
+        *(item for item in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+          if item and item != str(FLASH_AGENT_OVERLAY_ROOT)),
+    ] if entry
+)
+print("FLASH_AGENT_OVERLAY_REASSERTED", flush=True)
+import importlib
+
+_agent_module = importlib.import_module("inference.agent.tool_agent")
+_agent_module_path = Path(getattr(_agent_module, "__file__", "")).resolve()
+if _agent_module_path != _agent_overlay_path.resolve():
+    raise RuntimeError(
+        f"Flash agent-state overlay was not imported: {_agent_module_path}."
+    )
+_agent_module_sha256 = hashlib.sha256(_agent_module_path.read_bytes()).hexdigest()
+if _agent_module_sha256 != _agent_patch_record["overlay_tool_agent_sha256"]:
+    raise RuntimeError("Imported Flash agent-state overlay digest changed.")
+print(
+    "FLASH_AGENT_OVERLAY_IMPORTED",
+    json.dumps({
+        "tool_agent_path": str(_agent_module_path),
+        "tool_agent_sha256": _agent_module_sha256,
+    }),
+    flush=True,
+)
+"""
+    if not include_agent_state_patch:
+        setup_finish_injection = setup_finish_anchor
+    setup_finish_matches = 0
+    for candidate in notebook["cells"]:
+        if candidate.get("cell_type") != "code":
+            continue
+        candidate_source = "".join(candidate.get("source", []))
+        setup_finish_matches += candidate_source.count(setup_finish_anchor)
+        candidate_source = candidate_source.replace(setup_finish_anchor, setup_finish_injection)
+        candidate["source"] = candidate_source.splitlines(keepends=True)
+    if setup_finish_matches != 1:
+        raise ValueError(
+            "Flash agent-state setup-finish anchor did not match exactly once: "
+            f"setup_finish={setup_finish_matches}."
+        )
 
     if max_games is not None or runtime_seconds is not None:
         cell = next(
@@ -254,6 +400,12 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
         source = source.replace(
             'FLASH_OFFLINE_MAX_RUNTIME_S = float(os.environ.get("FLASH_OFFLINE_MAX_RUNTIME_S", "0"))',
             f'FLASH_OFFLINE_MAX_RUNTIME_S = 0.0 if TRUE_SUBMISSION else float(os.environ.get("FLASH_OFFLINE_MAX_RUNTIME_S", "{runtime_default}"))',
+            1,
+        )
+        grace_default = 120 if terminal_grace_seconds is None else terminal_grace_seconds
+        source = source.replace(
+            'FLASH_TERMINAL_GRACE_S = float(os.environ.get("FLASH_TERMINAL_GRACE_S", "0"))',
+            f'FLASH_TERMINAL_GRACE_S = 0.0 if TRUE_SUBMISSION else float(os.environ.get("FLASH_TERMINAL_GRACE_S", "{grace_default}"))',
             1,
         )
         if game_id is not None:
@@ -283,9 +435,12 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
                 replaced_budget += candidate_source.count(budget_anchor)
                 candidate_source = candidate_source.replace(
                     budget_anchor,
+                    'offline_batch_count = max(1, (len(bm.games) + int(bm.solver.concurrency) - 1) '
+                    '// int(bm.solver.concurrency))\n'
                     'budget = min(float(getattr(target, "max_runtime_s", 0.0) or 0.0), '
-                    'FLASH_OFFLINE_MAX_RUNTIME_S + 600.0) if FLASH_OFFLINE_MAX_RUNTIME_S > 0 '
-                    'else float(getattr(target, "max_runtime_s", 0.0) or 0.0)',
+                    'FLASH_OFFLINE_MAX_RUNTIME_S * offline_batch_count + 600.0) '
+                    'if FLASH_OFFLINE_MAX_RUNTIME_S > 0 else '
+                    'float(getattr(target, "max_runtime_s", 0.0) or 0.0)',
                 )
             candidate["source"] = candidate_source.splitlines(keepends=True)
         if replaced_settings != 1 or replaced_budget != 1:
@@ -302,12 +457,20 @@ print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
         deadline_replacement = """    ),
 )
 
-# Isolated diagnostics measure gameplay after serving setup, rather than charging
-# model loading time against the requested per-game runtime.
-if not TRUE_SUBMISSION and FLASH_OFFLINE_GAME_ID and FLASH_OFFLINE_MAX_RUNTIME_S > 0:
-    soft_end = datetime.now() + timedelta(seconds=budget - 600.0)
+# Bounded offline checks measure gameplay after serving setup. The small grace
+# lets the solver's own per-game cap finalize `gave_up` before the global
+# notebook deadline would mark the game cancelled.
+if not TRUE_SUBMISSION and FLASH_OFFLINE_MAX_RUNTIME_S > 0:
+    if not 0.0 <= FLASH_TERMINAL_GRACE_S < 600.0:
+        raise RuntimeError("FLASH_TERMINAL_GRACE_S must stay within the teardown reserve.")
+    gameplay_budget_s = budget - 600.0
+    soft_end = datetime.now() + timedelta(
+        seconds=gameplay_budget_s + FLASH_TERMINAL_GRACE_S
+    )
     print(
-        f\"PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={budget - 600.0}\",
+        f\"PUBLIC25_DEADLINE origin=post_setup gameplay_budget_s={gameplay_budget_s} \"
+        f\"terminal_grace_s={FLASH_TERMINAL_GRACE_S} \"
+        f\"offline_batch_count={offline_batch_count}\",
         flush=True,
     )
 elif not TRUE_SUBMISSION:
@@ -331,6 +494,39 @@ elif not TRUE_SUBMISSION:
                 "Flash preflight deadline anchor did not match exactly once: "
                 f"deadline={deadline_matches}."
             )
+
+    if analyzer_timeout is not None:
+        settings_anchor = "bm.solver.analyzer_timeout = 900.0"
+        replaced_timeout = 0
+        for candidate in notebook["cells"]:
+            if candidate.get("cell_type") != "code":
+                continue
+            candidate_source = "".join(candidate.get("source", []))
+            if settings_anchor in candidate_source:
+                replaced_timeout += candidate_source.count(settings_anchor)
+                candidate_source = candidate_source.replace(
+                    settings_anchor,
+                    "bm.solver.analyzer_timeout = (FLASH_ANALYZER_TIMEOUT "
+                    "if FLASH_ANALYZER_TIMEOUT > 0 else 900.0)",
+                )
+            candidate["source"] = candidate_source.splitlines(keepends=True)
+        if replaced_timeout != 1:
+            raise ValueError(
+                "Flash analyzer timeout anchor did not match exactly once: "
+                f"analyzer_timeout={replaced_timeout}."
+            )
+        cell = next(
+            cell for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+            and "FLASH_ANALYZER_TIMEOUT" in "".join(cell.get("source", []))
+        )
+        source = "".join(cell["source"])
+        source = source.replace(
+            'FLASH_ANALYZER_TIMEOUT = float(os.environ.get("FLASH_ANALYZER_TIMEOUT", "900"))',
+            f'FLASH_ANALYZER_TIMEOUT = float(os.environ.get("FLASH_ANALYZER_TIMEOUT", "{analyzer_timeout}"))',
+            1,
+        )
+        cell["source"] = source.splitlines(keepends=True)
 
     if concurrency is not None:
         concurrency_anchor = "bm.solver.concurrency = 28"
@@ -396,9 +592,18 @@ def build(args: argparse.Namespace) -> Path:
         raise FileNotFoundError(SOURCE_NOTEBOOK)
     notebook = json.loads(SOURCE_NOTEBOOK.read_text(encoding="utf-8"))
     if args.mode == "full" and any(
-        value is not None for value in (args.max_games, args.game_id, args.runtime_seconds)
+        value is not None
+        for value in (
+            args.max_games,
+            args.game_id,
+            args.runtime_seconds,
+            args.terminal_grace_seconds,
+        )
     ):
-        raise ValueError("--max-games, --game-id, and --runtime-seconds are only valid for preflight packages.")
+        raise ValueError(
+            "--max-games, --game-id, --runtime-seconds, and --terminal-grace-seconds "
+            "are only valid for preflight packages."
+        )
     if args.game_id is not None and args.max_games not in (None, 1):
         raise ValueError("--game-id can only be combined with --max-games 1.")
     max_games = 1 if args.mode == "preflight" and args.max_games is None else args.max_games
@@ -407,12 +612,19 @@ def build(args: argparse.Namespace) -> Path:
         1800 if args.mode == "preflight" and args.runtime_seconds is None
         else args.runtime_seconds
     )
+    terminal_grace_seconds = (
+        120 if args.mode == "preflight" and args.terminal_grace_seconds is None
+        else args.terminal_grace_seconds
+    )
     _add_preflight_support(
         notebook,
         max_games=max_games,
         concurrency=concurrency,
         game_id=args.game_id,
         runtime_seconds=runtime_seconds,
+        terminal_grace_seconds=terminal_grace_seconds,
+        analyzer_timeout=getattr(args, "analyzer_timeout", None),
+        include_agent_state_patch=getattr(args, "agent_state_patch", False),
     )
     _clean_execution(notebook)
     notebook_name = f"arc-agi3-qwen38-flash-next-mtp-{args.mode}.ipynb"
@@ -466,6 +678,23 @@ def main() -> None:
         type=int,
         help="Per-game offline runtime for an isolated preflight (default: 1800).",
     )
+    parser.add_argument(
+        "--terminal-grace-seconds",
+        type=int,
+        help="Bounded post-runtime grace for clean preflight termination (default: 120).",
+    )
+    parser.add_argument(
+        "--analyzer-timeout",
+        type=int,
+        help="Analyzer request timeout in seconds (default: 900).",
+    )
+    parser.add_argument(
+        "--agent-state-patch",
+        dest="agent_state_patch",
+        action="store_true",
+        help="Include the experimental reasoning-state overlay (off by default).",
+    )
+    parser.set_defaults(agent_state_patch=False)
     build(parser.parse_args())
 
 

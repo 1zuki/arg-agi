@@ -28,7 +28,8 @@ class FlashAuditTests(unittest.TestCase):
         self.write(name, doc)
 
     def fixture(self, full=False, game_count=None, concurrency=28, game_id=None,
-                runtime_seconds=None, deadline_origin=None):
+                runtime_seconds=None, deadline_origin=None, terminal_grace_seconds=None,
+                agent_state_patch=False, analyzer_timeout=900):
         count = len(AUDIT.PUBLIC_IDS) if full else (game_count or 1)
         ids = [game_id] if game_id is not None else list(AUDIT.PUBLIC_IDS[:count])
         runtime_seconds = runtime_seconds or (7920 if full else 1800)
@@ -46,11 +47,33 @@ class FlashAuditTests(unittest.TestCase):
             'patch': 'gpu-release-settle-v1', 'source_sha256': AUDIT.SOURCE_HASH,
             'patched_sha256': AUDIT.PATCH_HASH,
         })
+        digest_overrides = {'flash_serving_teardown.py': AUDIT.PATCH_HASH}
+        agent_records = ''
+        if agent_state_patch:
+            patch_record = {
+                'patch': AUDIT.AGENT_PATCH_NAME,
+                'source_sha256': AUDIT.AGENT_SOURCE_HASH,
+                'patched_sha256': AUDIT.AGENT_PATCH_HASH,
+                'overlay_tool_agent_sha256': AUDIT.AGENT_PATCH_HASH,
+            }
+            self.write('flash_agent_state_patch.json', patch_record)
+            overlay = self.root / AUDIT.AGENT_OVERLAY_PATH
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            overlay.write_bytes(b'fixture-agent-overlay')
+            digest_overrides[AUDIT.AGENT_OVERLAY_PATH] = AUDIT.AGENT_PATCH_HASH
+            agent_records = (
+                f'FLASH_AGENT_STATE_PATCH {json.dumps(patch_record)}\n'
+                f'FLASH_AGENT_OVERLAY_READY {json.dumps({"root": "/kaggle/working/flash_agent_overlay", "tool_agent_sha256": AUDIT.AGENT_PATCH_HASH})}\n'
+                'FLASH_AGENT_OVERLAY_REASSERTED\n'
+                f'FLASH_AGENT_OVERLAY_IMPORTED {json.dumps({"tool_agent_path": "/kaggle/working/" + AUDIT.AGENT_OVERLAY_PATH, "tool_agent_sha256": AUDIT.AGENT_PATCH_HASH})}\n'
+            )
         from unittest.mock import patch
         original_digest = AUDIT.digest
-        mock = patch.object(AUDIT, 'digest', side_effect=lambda root, name:
-                            AUDIT.PATCH_HASH if name == 'flash_serving_teardown.py'
-                            else original_digest(root, name))
+        def mocked_digest(root, name):
+            override = digest_overrides.get(name)
+            return override if override is not None else original_digest(root, name)
+
+        mock = patch.object(AUDIT, 'digest', side_effect=mocked_digest)
         mock.start()
         self.addCleanup(mock.stop)
         artifacts = {n: {'exists': True, 'is_file': True,
@@ -82,18 +105,25 @@ class FlashAuditTests(unittest.TestCase):
             'game_runs': [{'game_id': g, 'state': 'gave_up', 'final_score': 1.0,
                            'history': [{}], 'final_wallclock_seconds': 50.0} for g in ids]})
         suffix = 'full' if full else 'preflight'
-        deadline = (
-            f'PUBLIC25_DEADLINE origin={deadline_origin} '
-            f'gameplay_budget_s={runtime_seconds}.0\n'
-            if deadline_origin is not None else ''
-        )
+        deadline = ''
+        if deadline_origin is not None:
+            deadline = (
+                f'PUBLIC25_DEADLINE origin={deadline_origin} '
+                f'gameplay_budget_s={runtime_seconds}.0'
+            )
+            if terminal_grace_seconds is not None:
+                deadline += f' terminal_grace_s={float(terminal_grace_seconds)}'
+            deadline += '\n'
         self.write(f'arc-agi3-flash-next-mtp-{suffix}.log', [{'data':
-            f'PUBLIC25_SETTINGS budget_s={runtime_seconds}.0 concurrency={concurrency} analyzer_timeout=900.0\n'
-            f'{deadline}PUBLIC25_AUDIT runs={len(ids)} actions=25\n'}])
+            f'PUBLIC25_SETTINGS budget_s={runtime_seconds}.0 concurrency={concurrency} analyzer_timeout={float(analyzer_timeout)}\n'
+            f'{agent_records}{deadline}PUBLIC25_AUDIT runs={len(ids)} actions=25\n'}])
 
     def run_audit(self, full=False, expected_games=None, expected_concurrency=None,
                   expected_game_id=None, expected_runtime_seconds=None,
-                  require_clean=False, require_runtime_from_ready=False):
+                  require_clean=False, require_runtime_from_ready=False,
+                  expected_terminal_grace_seconds=None, require_agent_state_patch=False,
+                  expected_analyzer_timeout=900, kernel_log=None,
+                  expected_gameplay_budget_seconds=None):
         return AUDIT.audit(
             self.root,
             'full-offline' if full else 'preflight',
@@ -104,6 +134,11 @@ class FlashAuditTests(unittest.TestCase):
             expected_runtime_seconds=expected_runtime_seconds,
             require_clean=require_clean,
             require_runtime_from_ready=require_runtime_from_ready,
+            expected_terminal_grace_seconds=expected_terminal_grace_seconds,
+            require_agent_state_patch=require_agent_state_patch,
+            expected_analyzer_timeout=expected_analyzer_timeout,
+            kernel_log=kernel_log,
+            expected_gameplay_budget_seconds=expected_gameplay_budget_seconds,
         )
 
     def test_valid_preflight(self):
@@ -132,6 +167,51 @@ class FlashAuditTests(unittest.TestCase):
         report = self.run_audit(full=True, expected_concurrency=8)
         self.assertEqual(report['kernel_log'], 'arc-agi3-flash-next-mtp-c8-full.log')
 
+    def test_explicit_kernel_log_requires_all_existing_runtime_gates(self):
+        self.fixture(game_count=12, concurrency=12)
+        name = 'arc-agi3-flash-next-mtp-c12-candidate1200.log'
+        (self.root / 'arc-agi3-flash-next-mtp-preflight.log').rename(self.root / name)
+        with self.assertRaisesRegex(ValueError, 'mode-matching kernel log'):
+            self.run_audit(expected_games=12, expected_concurrency=12)
+        report = self.run_audit(expected_games=12, expected_concurrency=12, kernel_log=name)
+        self.assertEqual(report['kernel_log'], name)
+        with self.assertRaisesRegex(ValueError, 'runtime configuration mismatch'):
+            self.run_audit(expected_games=12, expected_concurrency=28, kernel_log=name)
+
+    def test_preflight_can_audit_scheduled_multi_batch_budget(self):
+        self.fixture(game_count=25, concurrency=12, runtime_seconds=1800,
+                     deadline_origin='post_setup', terminal_grace_seconds=120)
+        name = 'arc-agi3-flash-next-mtp-c12-full.log'
+        (self.root / 'arc-agi3-flash-next-mtp-preflight.log').rename(self.root / name)
+        self.change(name, lambda rows: rows[0].update(data=rows[0]['data'].replace(
+            'gameplay_budget_s=1800.0', 'gameplay_budget_s=5400.0'
+        )))
+        report = self.run_audit(
+            expected_games=25,
+            expected_concurrency=12,
+            expected_runtime_seconds=1800,
+            expected_gameplay_budget_seconds=5400,
+            expected_terminal_grace_seconds=120,
+            kernel_log=name,
+        )
+        self.assertEqual(report['expected_gameplay_budget_seconds'], 5400)
+        with self.assertRaisesRegex(ValueError, 'terminal grace'):
+            self.run_audit(expected_games=25, expected_concurrency=12,
+                           expected_gameplay_budget_seconds=1800,
+                           expected_terminal_grace_seconds=120, kernel_log=name)
+
+    def test_explicit_kernel_log_rejects_unsafe_missing_and_symlink_names(self):
+        self.fixture()
+        for name in ('../arc-agi3-flash-next-mtp-preflight.log', 'vllm-openai-server.log', ''):
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, 'invalid explicit'):
+                self.run_audit(kernel_log=name)
+        name = 'arc-agi3-flash-next-mtp-missing.log'
+        with self.assertRaisesRegex(ValueError, 'missing or symlink'):
+            self.run_audit(kernel_log=name)
+        (self.root / name).symlink_to(self.root / 'arc-agi3-flash-next-mtp-preflight.log')
+        with self.assertRaisesRegex(ValueError, 'missing or symlink'):
+            self.run_audit(kernel_log=name)
+
     def test_custom_preflight_concurrency_mismatch_rejected(self):
         self.fixture(game_count=8, concurrency=28)
         with self.assertRaisesRegex(ValueError, 'runtime configuration mismatch'):
@@ -154,6 +234,53 @@ class FlashAuditTests(unittest.TestCase):
         )
         self.assertEqual(report['expected_game_id'], 'tr87-cd924810')
         self.assertTrue(report['require_clean'])
+
+    def test_agent_state_patch_and_terminal_grace_are_required_when_requested(self):
+        self.fixture(
+            game_count=12,
+            concurrency=12,
+            runtime_seconds=1800,
+            deadline_origin='post_setup',
+            terminal_grace_seconds=120,
+            agent_state_patch=True,
+        )
+        report = self.run_audit(
+            expected_games=12,
+            expected_concurrency=12,
+            expected_runtime_seconds=1800,
+            expected_terminal_grace_seconds=120,
+            require_agent_state_patch=True,
+        )
+        self.assertTrue(report['agent_state_patch_required'])
+        self.assertEqual(report['expected_terminal_grace_seconds'], 120)
+
+    def test_custom_analyzer_timeout_is_checked(self):
+        self.fixture(game_count=12, concurrency=28, analyzer_timeout=1200)
+        report = self.run_audit(expected_games=12, expected_analyzer_timeout=1200)
+        self.assertEqual(report['game_count'], 12)
+        self.assertEqual(report['expected_analyzer_timeout'], 1200)
+
+        with self.assertRaisesRegex(ValueError, 'runtime configuration mismatch'):
+            self.run_audit(expected_games=12, expected_analyzer_timeout=900)
+
+    def test_agent_state_patch_missing_or_wrong_grace_is_rejected(self):
+        self.fixture(game_count=12, concurrency=12, runtime_seconds=1800,
+                     deadline_origin='post_setup', terminal_grace_seconds=120)
+        with self.assertRaisesRegex(ValueError, 'flash_agent_state_patch'):
+            self.run_audit(
+                expected_games=12,
+                expected_concurrency=12,
+                expected_runtime_seconds=1800,
+                expected_terminal_grace_seconds=120,
+                require_agent_state_patch=True,
+            )
+        with self.assertRaisesRegex(ValueError, 'terminal grace'):
+            self.run_audit(
+                expected_games=12,
+                expected_concurrency=12,
+                expected_runtime_seconds=1800,
+                expected_terminal_grace_seconds=119,
+            )
 
     def test_clean_isolated_preflight_rejects_cancellation(self):
         self.fixture(

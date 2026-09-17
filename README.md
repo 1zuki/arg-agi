@@ -1,5 +1,9 @@
 # ARC-AGI-3 Qwen3.8 + checkpoint-8 + adapter-fix candidate
 
+**Latest experimental handoff:** [Flash-Next/MTP no-overlay c12 Kaggle package](kaggle/flash-next-nostate-c12/README.md).
+Includes the full notebook, corrected preflight, and run/audit/submit instructions.
+This c12 variant has not completed a corrected preflight or full run; the public **3.40** incumbent remains protected.
+
 The primary submission notebook is `arc-agi.ipynb`. It preserves the public
 [Tufa Labs duck harness](https://github.com/Tufalabs/duck-harness) as the solver
 base, swaps its local analyzer to `Qwen/Qwen3.8-27B-FP8` at revision
