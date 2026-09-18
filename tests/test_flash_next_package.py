@@ -335,6 +335,39 @@ class FlashCoverageTests(unittest.TestCase):
         self.assertIsNone(value.body.value)
         self.assertIn("seconds=budget - 600.0", ast.unparse(value.orelse))
 
+    def test_full_runtime_cap_covers_all_c8_batches_with_a_fixed_reserve(self):
+        notebook = json.loads(BUILDER.SOURCE_NOTEBOOK.read_text())
+        BUILDER._add_preflight_support(
+            notebook,
+            max_games=None,
+            concurrency=8,
+            full_runtime_seconds=7200,
+        )
+        source = "\n".join(
+            "".join(cell.get("source", [])) for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+        )
+        self.assertIn(
+            'FLASH_FULL_RUNTIME_S = float(os.environ.get("FLASH_FULL_RUNTIME_S", "7200"))',
+            source,
+        )
+        self.assertIn(
+            "bm.solver.max_runtime_s_per_game = (FLASH_FULL_RUNTIME_S "
+            "if FLASH_FULL_RUNTIME_S > 0 else 7920.0)",
+            source,
+        )
+        self.assertIn("PUBLIC25_FULL_SCHEDULE runtime_s=", source)
+        self.assertIn("+ 3600.0", source)
+        BUILDER._compile_notebook(notebook, "full-c8-runtime-test")
+
+        with self.assertRaisesRegex(ValueError, "32400-second Kaggle budget"):
+            BUILDER._add_preflight_support(
+                json.loads(BUILDER.SOURCE_NOTEBOOK.read_text()),
+                max_games=None,
+                concurrency=8,
+                full_runtime_seconds=7201,
+            )
+
     def test_teardown_uses_pinned_gpu_release_settle_patch(self):
         notebook = json.loads(BUILDER.SOURCE_NOTEBOOK.read_text())
         BUILDER._add_preflight_support(notebook, max_games=1)

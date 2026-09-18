@@ -40,6 +40,7 @@ PUBLIC_GAME_IDS = (
     "tr87-cd924810",
 )
 MAX_TERMINAL_GRACE_SECONDS = 599
+FULL_RUNTIME_RESERVE_SECONDS = 3600
 
 
 def _slugify(value: str) -> str:
@@ -102,6 +103,25 @@ def _validate_terminal_grace_seconds(value: int | None) -> None:
         )
 
 
+def _validate_full_runtime_schedule(
+    runtime_seconds: int | None,
+    concurrency: int | None,
+) -> None:
+    """Reject full-run caps that cannot fit all public-game batches safely."""
+    if runtime_seconds is None:
+        return
+    _validate_preflight_setting(runtime_seconds, name="full_runtime_seconds")
+    effective_concurrency = 28 if concurrency is None else concurrency
+    _validate_preflight_setting(effective_concurrency, name="concurrency")
+    batch_count = (PUBLIC_GAME_COUNT + effective_concurrency - 1) // effective_concurrency
+    required_seconds = runtime_seconds * batch_count + FULL_RUNTIME_RESERVE_SECONDS
+    if required_seconds > 32400:
+        raise ValueError(
+            "full_runtime_seconds and concurrency need more than the 32400-second "
+            "Kaggle budget after the required setup/teardown reserve."
+        )
+
+
 def _add_preflight_support(
     notebook: dict,
     *,
@@ -112,18 +132,24 @@ def _add_preflight_support(
     terminal_grace_seconds: int | None = None,
     analyzer_timeout: int | None = None,
     include_agent_state_patch: bool = False,
+    full_runtime_seconds: int | None = None,
 ) -> None:
     _validate_preflight_setting(max_games, name="max_games", maximum=PUBLIC_GAME_COUNT)
     _validate_preflight_setting(concurrency, name="concurrency")
     _validate_preflight_setting(runtime_seconds, name="runtime_seconds")
     _validate_preflight_setting(analyzer_timeout, name="analyzer_timeout")
     _validate_terminal_grace_seconds(terminal_grace_seconds)
+    _validate_full_runtime_schedule(full_runtime_seconds, concurrency)
     if game_id is not None and game_id not in PUBLIC_GAME_IDS:
         raise ValueError(f"game_id must be one of the pinned public game IDs: {game_id!r}.")
     if game_id is not None and max_games not in (None, 1):
         raise ValueError("game_id preflights must select exactly one game.")
 
     start_anchor = "NOTEBOOK_START_EPOCH = time.time()\n"
+    full_runtime_injection = (
+        f'FLASH_FULL_RUNTIME_S = float(os.environ.get("FLASH_FULL_RUNTIME_S", "{full_runtime_seconds}"))\n'
+        if full_runtime_seconds is not None else ""
+    )
     start_injection = (
         "\n"
         "FLASH_OFFLINE_MAX_GAMES = int(os.environ.get(\"FLASH_OFFLINE_MAX_GAMES\", \"0\"))\n"
@@ -132,6 +158,7 @@ def _add_preflight_support(
         "FLASH_OFFLINE_MAX_RUNTIME_S = float(os.environ.get(\"FLASH_OFFLINE_MAX_RUNTIME_S\", \"0\"))\n"
         "FLASH_TERMINAL_GRACE_S = float(os.environ.get(\"FLASH_TERMINAL_GRACE_S\", \"0\"))\n"
         "FLASH_ANALYZER_TIMEOUT = float(os.environ.get(\"FLASH_ANALYZER_TIMEOUT\", \"900\"))\n"
+        + full_runtime_injection.replace("        ", "", 1)
     )
     matches = 0
     for cell in notebook["cells"]:
@@ -562,6 +589,69 @@ elif not TRUE_SUBMISSION:
         )
         cell["source"] = source.splitlines(keepends=True)
 
+    if full_runtime_seconds is not None:
+        settings_anchor = "bm.solver.max_runtime_s_per_game = 7920.0"
+        schedule_anchor = """if float(getattr(target, 'max_runtime_s', 0.0) or 0.0) != 32400.0:
+    raise RuntimeError(
+        f'Expected the 32400-second notebook budget, got {target.max_runtime_s!r}.'
+    )
+"""
+        settings_matches = 0
+        schedule_matches = 0
+        for candidate in notebook["cells"]:
+            if candidate.get("cell_type") != "code":
+                continue
+            candidate_source = "".join(candidate.get("source", []))
+            if settings_anchor in candidate_source:
+                settings_matches += candidate_source.count(settings_anchor)
+                candidate_source = candidate_source.replace(
+                    settings_anchor,
+                    "bm.solver.max_runtime_s_per_game = (FLASH_FULL_RUNTIME_S "
+                    "if FLASH_FULL_RUNTIME_S > 0 else 7920.0)",
+                )
+            if schedule_anchor in candidate_source:
+                schedule_matches += candidate_source.count(schedule_anchor)
+                schedule_source = schedule_anchor + """full_batch_count = max(
+    1, (25 + int(bm.solver.concurrency) - 1) // int(bm.solver.concurrency)
+)
+full_required_seconds = (
+    bm.solver.max_runtime_s_per_game * full_batch_count
+    + 3600.0
+)
+if full_required_seconds > float(target.max_runtime_s):
+    raise RuntimeError(
+        "Full runtime schedule exceeds the Kaggle budget after the setup/teardown reserve: "
+        f"required={full_required_seconds}, budget={target.max_runtime_s!r}."
+    )
+print(
+    f"PUBLIC25_FULL_SCHEDULE runtime_s={bm.solver.max_runtime_s_per_game} "
+    f"concurrency={bm.solver.concurrency} batches={full_batch_count} "
+    f"reserve_s=3600.0 required_s={full_required_seconds}",
+    flush=True,
+)
+"""
+                candidate_source = candidate_source.replace(schedule_anchor, schedule_source)
+            candidate["source"] = candidate_source.splitlines(keepends=True)
+        if settings_matches != 1 or schedule_matches != 1:
+            raise ValueError(
+                "Flash full-runtime anchors did not match exactly once: "
+                f"settings={settings_matches}, schedule={schedule_matches}."
+            )
+        cell = next(
+            cell
+            for cell in notebook["cells"]
+            if cell.get("cell_type") == "code"
+            and "FLASH_FULL_RUNTIME_S" in "".join(cell.get("source", []))
+        )
+        source = "".join(cell["source"])
+        source = source.replace(
+            'FLASH_FULL_RUNTIME_S = float(os.environ.get("FLASH_FULL_RUNTIME_S", "0"))',
+            'FLASH_FULL_RUNTIME_S = float(os.environ.get("FLASH_FULL_RUNTIME_S", '
+            f'"{full_runtime_seconds}"))',
+            1,
+        )
+        cell["source"] = source.splitlines(keepends=True)
+
 
 def _metadata(kernel_id: str, notebook_name: str, title: str) -> dict:
     _parse_kernel_id(kernel_id)
@@ -625,6 +715,7 @@ def build(args: argparse.Namespace) -> Path:
         terminal_grace_seconds=terminal_grace_seconds,
         analyzer_timeout=getattr(args, "analyzer_timeout", None),
         include_agent_state_patch=getattr(args, "agent_state_patch", False),
+        full_runtime_seconds=getattr(args, "full_runtime_seconds", None),
     )
     _clean_execution(notebook)
     notebook_name = f"arc-agi3-qwen38-flash-next-mtp-{args.mode}.ipynb"
@@ -677,6 +768,14 @@ def main() -> None:
         "--runtime-seconds",
         type=int,
         help="Per-game offline runtime for an isolated preflight (default: 1800).",
+    )
+    parser.add_argument(
+        "--full-runtime-seconds",
+        type=int,
+        help=(
+            "Per-game cap for a full package. The builder rejects caps whose public-game "
+            "worker batches cannot fit inside Kaggle's nine-hour budget with a reserve."
+        ),
     )
     parser.add_argument(
         "--terminal-grace-seconds",
