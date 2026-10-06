@@ -27,6 +27,18 @@ Required Kaggle inputs:
 The old local CWM/RL baseline path has been removed from this snapshot. See
 `ARCHITECTURE.md` for the current submission flow and remaining risks.
 
+## Attribution
+
+- **Tufa Labs and Jeroen Cottaar**: original Duck harness, solver, and
+  competition notebook: [Tufa Labs' Duck harness](https://github.com/Tufalabs/duck-harness).
+- **Daniel Franzen**: Milestone 2 solution and public fork at
+  [`da-fr/arc-agi-3-solution`](https://github.com/da-fr/arc-agi-3-solution),
+  which is the foundation for the Milestone 2 material carried in this
+  repository.
+
+Please preserve both attributions when reusing the corresponding harness or
+Milestone 2 solution work.
+
 ## Why this candidate
 
 The previous repository candidate completed an audited 25-public-game Kaggle
