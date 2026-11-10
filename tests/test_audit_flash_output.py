@@ -29,7 +29,8 @@ class FlashAuditTests(unittest.TestCase):
 
     def fixture(self, full=False, game_count=None, concurrency=28, game_id=None,
                 runtime_seconds=None, deadline_origin=None, terminal_grace_seconds=None,
-                agent_state_patch=False, analyzer_timeout=900):
+                agent_state_patch=False, analyzer_timeout=900, action7_patch=False,
+                inspection_action_patch=False, zero_change_repeat_guard=False):
         count = len(AUDIT.PUBLIC_IDS) if full else (game_count or 1)
         ids = [game_id] if game_id is not None else list(AUDIT.PUBLIC_IDS[:count])
         runtime_seconds = runtime_seconds or (7920 if full else 1800)
@@ -66,6 +67,74 @@ class FlashAuditTests(unittest.TestCase):
                 f'FLASH_AGENT_OVERLAY_READY {json.dumps({"root": "/kaggle/working/flash_agent_overlay", "tool_agent_sha256": AUDIT.AGENT_PATCH_HASH})}\n'
                 'FLASH_AGENT_OVERLAY_REASSERTED\n'
                 f'FLASH_AGENT_OVERLAY_IMPORTED {json.dumps({"tool_agent_path": "/kaggle/working/" + AUDIT.AGENT_OVERLAY_PATH, "tool_agent_sha256": AUDIT.AGENT_PATCH_HASH})}\n'
+            )
+        if action7_patch:
+            patch_record = {
+                'patch': AUDIT.ACTION7_PATCH_NAME,
+                'source_sha256': AUDIT.ACTION7_SOURCE_HASH,
+                'patched_sha256': AUDIT.ACTION7_PATCH_HASH,
+                'overlay_action_names_sha256': AUDIT.ACTION7_PATCH_HASH,
+            }
+            self.write('flash_action7_patch.json', patch_record)
+            # Use real patched bytes so tampering tests exercise the digest check.
+            patch_spec = importlib.util.spec_from_file_location(
+                'action7_patch', ROOT / 'scripts/flash_action7_patch.py')
+            patcher = importlib.util.module_from_spec(patch_spec)
+            patch_spec.loader.exec_module(patcher)
+            overlay = self.root / AUDIT.ACTION7_OVERLAY_PATH
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            overlay.write_text(patcher.patch_action_names(
+                (ROOT / 'tests/fixtures/flash_action_names.py').read_bytes()))
+            agent_records += (
+                f'FLASH_ACTION7_PATCH {json.dumps(patch_record)}\n'
+                f'FLASH_ACTION7_OVERLAY_READY {json.dumps({"root": "/kaggle/working/flash_action7_overlay", "action_names_sha256": AUDIT.ACTION7_PATCH_HASH})}\n'
+                'FLASH_ACTION7_OVERLAY_REASSERTED\n'
+                f'FLASH_ACTION7_OVERLAY_IMPORTED {json.dumps({"action_names_path": "/kaggle/working/" + AUDIT.ACTION7_OVERLAY_PATH, "action_names_sha256": AUDIT.ACTION7_PATCH_HASH})}\n'
+            )
+        if inspection_action_patch:
+            patch_record = {
+                'patch': AUDIT.INSPECTION_ACTION_PATCH_NAME,
+                'source_sha256': AUDIT.INSPECTION_ACTION_SOURCE_HASH,
+                'patched_sha256': AUDIT.INSPECTION_ACTION_PATCH_HASH,
+                'overlay_tool_agent_sha256': AUDIT.INSPECTION_ACTION_PATCH_HASH,
+            }
+            self.write('flash_inspection_action_patch.json', patch_record)
+            patch_spec = importlib.util.spec_from_file_location(
+                'inspection_action_patch', ROOT / 'scripts/flash_inspection_action_patch.py')
+            patcher = importlib.util.module_from_spec(patch_spec)
+            patch_spec.loader.exec_module(patcher)
+            overlay = self.root / AUDIT.INSPECTION_ACTION_OVERLAY_PATH
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            overlay.write_text(patcher.patch_tool_agent(
+                (ROOT / 'build/flash-baseline-source-20260920/tool_agent.py').read_bytes()))
+            agent_records += (
+                f'FLASH_INSPECTION_ACTION_PATCH {json.dumps(patch_record)}\n'
+                f'FLASH_INSPECTION_ACTION_OVERLAY_READY {json.dumps({"root": "/kaggle/working/flash_inspection_action_overlay", "tool_agent_sha256": AUDIT.INSPECTION_ACTION_PATCH_HASH})}\n'
+                'FLASH_INSPECTION_ACTION_OVERLAY_REASSERTED\n'
+                f'FLASH_INSPECTION_ACTION_OVERLAY_IMPORTED {json.dumps({"tool_agent_path": "/kaggle/working/" + AUDIT.INSPECTION_ACTION_OVERLAY_PATH, "tool_agent_sha256": AUDIT.INSPECTION_ACTION_PATCH_HASH})}\n'
+            )
+        if zero_change_repeat_guard:
+            patch_record = {
+                'patch': AUDIT.ZERO_CHANGE_REPEAT_GUARD_PATCH_NAME,
+                'source_sha256': AUDIT.ZERO_CHANGE_REPEAT_GUARD_SOURCE_HASH,
+                'patched_sha256': AUDIT.ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH,
+                'overlay_tool_agent_sha256': AUDIT.ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH,
+            }
+            self.write('flash_zero_change_repeat_guard_patch.json', patch_record)
+            patch_spec = importlib.util.spec_from_file_location(
+                'zero_change_repeat_guard_patch', ROOT / 'scripts/flash_zero_change_repeat_guard_patch.py')
+            patcher = importlib.util.module_from_spec(patch_spec)
+            patch_spec.loader.exec_module(patcher)
+            overlay = self.root / AUDIT.ZERO_CHANGE_REPEAT_GUARD_OVERLAY_PATH
+            overlay.parent.mkdir(parents=True, exist_ok=True)
+            overlay.write_text(patcher.patch_tool_agent(
+                (ROOT / 'build/flash-baseline-source-20260920/tool_agent.py').read_bytes()))
+            digest_overrides[AUDIT.ZERO_CHANGE_REPEAT_GUARD_OVERLAY_PATH] = AUDIT.ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH
+            agent_records += (
+                f'FLASH_ZERO_CHANGE_REPEAT_GUARD_PATCH {json.dumps(patch_record)}\n'
+                f'FLASH_ZERO_CHANGE_REPEAT_GUARD_OVERLAY_READY {json.dumps({"root": "/kaggle/working/flash_zero_change_repeat_guard_overlay", "tool_agent_sha256": AUDIT.ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH})}\n'
+                'FLASH_ZERO_CHANGE_REPEAT_GUARD_OVERLAY_REASSERTED\n'
+                f'FLASH_ZERO_CHANGE_REPEAT_GUARD_OVERLAY_IMPORTED {json.dumps({"tool_agent_path": "/kaggle/working/" + AUDIT.ZERO_CHANGE_REPEAT_GUARD_OVERLAY_PATH, "tool_agent_sha256": AUDIT.ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH})}\n'
             )
         from unittest.mock import patch
         original_digest = AUDIT.digest
@@ -123,7 +192,8 @@ class FlashAuditTests(unittest.TestCase):
                   require_clean=False, require_runtime_from_ready=False,
                   expected_terminal_grace_seconds=None, require_agent_state_patch=False,
                   expected_analyzer_timeout=900, kernel_log=None,
-                  expected_gameplay_budget_seconds=None):
+                  expected_gameplay_budget_seconds=None, require_action7_patch=False,
+                  require_inspection_action_patch=False, require_zero_change_repeat_guard=False):
         return AUDIT.audit(
             self.root,
             'full-offline' if full else 'preflight',
@@ -136,10 +206,108 @@ class FlashAuditTests(unittest.TestCase):
             require_runtime_from_ready=require_runtime_from_ready,
             expected_terminal_grace_seconds=expected_terminal_grace_seconds,
             require_agent_state_patch=require_agent_state_patch,
+            require_action7_patch=require_action7_patch,
+            require_inspection_action_patch=require_inspection_action_patch,
+            require_zero_change_repeat_guard=require_zero_change_repeat_guard,
             expected_analyzer_timeout=expected_analyzer_timeout,
             kernel_log=kernel_log,
             expected_gameplay_budget_seconds=expected_gameplay_budget_seconds,
         )
+
+    def test_action7_requires_explicit_candidate_audit(self):
+        self.fixture(action7_patch=True)
+        with self.assertRaisesRegex(ValueError, 'explicit --require-action7-patch'):
+            self.run_audit()
+        self.assertTrue(self.run_audit(require_action7_patch=True)['action7_patch_required'])
+
+    def test_action7_full_audit_passes(self):
+        self.fixture(full=True, action7_patch=True)
+        self.assertTrue(self.run_audit(full=True, require_action7_patch=True)['passed'])
+
+    def test_action7_missing_patch_rejected(self):
+        self.fixture()
+        with self.assertRaisesRegex(ValueError, 'flash_action7_patch.json'):
+            self.run_audit(require_action7_patch=True)
+
+    def test_action7_tampered_source_rejected(self):
+        self.fixture(action7_patch=True)
+        (self.root / AUDIT.ACTION7_OVERLAY_PATH).write_text('tampered')
+        with self.assertRaisesRegex(ValueError, 'ACTION7 overlay source changed'):
+            self.run_audit(require_action7_patch=True)
+
+    def test_action7_wrong_identity_rejected(self):
+        self.fixture(action7_patch=True)
+        self.change('flash_action7_patch.json', lambda d: d.update(patch='other'))
+        with self.assertRaisesRegex(ValueError, 'ACTION7 patch identity mismatch'):
+            self.run_audit(require_action7_patch=True)
+
+    def test_action7_each_missing_lifecycle_marker_rejected(self):
+        self.fixture(action7_patch=True)
+        name = 'arc-agi3-flash-next-mtp-preflight.log'
+        original = (self.root / name).read_text()
+        for marker in ('FLASH_ACTION7_PATCH', 'FLASH_ACTION7_OVERLAY_READY',
+                       'FLASH_ACTION7_OVERLAY_REASSERTED', 'FLASH_ACTION7_OVERLAY_IMPORTED'):
+            with self.subTest(marker=marker):
+                (self.root / name).write_text(original.replace(marker, 'MISSING'))
+                with self.assertRaisesRegex(ValueError, 'ACTION7'):
+                    self.run_audit(require_action7_patch=True)
+
+    def test_action7_rejects_state_overlay_mixture(self):
+        self.fixture(action7_patch=True, agent_state_patch=True)
+        with self.assertRaisesRegex(ValueError, 'must not contain'):
+            self.run_audit(require_action7_patch=True)
+        with self.assertRaisesRegex(ValueError, 'separate experiments'):
+            self.run_audit(require_action7_patch=True, require_agent_state_patch=True)
+
+    def test_inspection_action_requires_explicit_candidate_audit(self):
+        self.fixture(inspection_action_patch=True)
+        with self.assertRaisesRegex(ValueError, 'explicit --require-inspection-action-patch'):
+            self.run_audit()
+        report = self.run_audit(require_inspection_action_patch=True)
+        self.assertTrue(report['inspection_action_patch_required'])
+
+    def test_inspection_action_full_audit_passes(self):
+        self.fixture(full=True, inspection_action_patch=True)
+        report = self.run_audit(full=True, require_inspection_action_patch=True)
+        self.assertTrue(report['passed'])
+
+    def test_inspection_action_tampered_source_rejected(self):
+        self.fixture(inspection_action_patch=True)
+        (self.root / AUDIT.INSPECTION_ACTION_OVERLAY_PATH).write_text('tampered')
+        with self.assertRaisesRegex(ValueError, 'inspection-action overlay source changed'):
+            self.run_audit(require_inspection_action_patch=True)
+
+    def test_inspection_action_missing_lifecycle_marker_rejected(self):
+        self.fixture(inspection_action_patch=True)
+        name = 'arc-agi3-flash-next-mtp-preflight.log'
+        original = (self.root / name).read_text()
+        for marker in (
+            'FLASH_INSPECTION_ACTION_PATCH',
+            'FLASH_INSPECTION_ACTION_OVERLAY_READY',
+            'FLASH_INSPECTION_ACTION_OVERLAY_REASSERTED',
+            'FLASH_INSPECTION_ACTION_OVERLAY_IMPORTED',
+        ):
+            with self.subTest(marker=marker):
+                (self.root / name).write_text(original.replace(marker, 'MISSING'))
+                with self.assertRaisesRegex(ValueError, 'inspection-action'):
+                    self.run_audit(require_inspection_action_patch=True)
+
+    def test_inspection_action_rejects_prior_experiment_mixture(self):
+        self.fixture(inspection_action_patch=True, agent_state_patch=True)
+        with self.assertRaisesRegex(ValueError, 'must not contain'):
+            self.run_audit(require_inspection_action_patch=True)
+        with self.assertRaisesRegex(ValueError, 'separate experiments'):
+            self.run_audit(
+                require_inspection_action_patch=True,
+                require_agent_state_patch=True,
+            )
+
+    def test_zero_change_repeat_guard_requires_explicit_candidate_audit(self):
+        self.fixture(zero_change_repeat_guard=True)
+        with self.assertRaisesRegex(ValueError, 'explicit --require-zero-change-repeat-guard'):
+            self.run_audit()
+        report = self.run_audit(require_zero_change_repeat_guard=True)
+        self.assertTrue(report['zero_change_repeat_guard_required'])
 
     def test_valid_preflight(self):
         self.fixture()

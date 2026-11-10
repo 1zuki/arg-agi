@@ -23,6 +23,22 @@ AGENT_PATCH_NAME = 'reasoning-world-model-v1'
 AGENT_SOURCE_HASH = '535ee88b81b262fa5aedb785466ade9f3183a6417656fb6733427242baac7c9d'
 AGENT_PATCH_HASH = '978026a51c438744c64922571b2264f09a3d4ec4259ddc75b03ccc0f3ba0b772'
 AGENT_OVERLAY_PATH = 'flash_agent_overlay/inference/agent/tool_agent.py'
+ACTION7_PATCH_NAME = 'action7-passthrough-v1'
+ACTION7_SOURCE_HASH = 'd359c22dd9f3925ed54cb05a60640e8aa1121c226a068b4736e8dfad46d2d115'
+ACTION7_PATCH_HASH = '07abd197442bc1d075067717b7dd357f39f9385d90e1ecdeebe6d5de199ae156'
+ACTION7_OVERLAY_PATH = 'flash_action7_overlay/inference/agent/action_names.py'
+DIRECT_RETRY_PATCH_NAME = 'direct-tool-retry-v1'
+DIRECT_RETRY_SOURCE_HASH = '535ee88b81b262fa5aedb785466ade9f3183a6417656fb6733427242baac7c9d'
+DIRECT_RETRY_PATCH_HASH = '89a042e1a7824db7c48591d41a35d5e0d45e0e4842a4817abac7f6b5fa98fe53'
+DIRECT_RETRY_OVERLAY_PATH = 'flash_direct_retry_overlay/inference/agent/tool_agent.py'
+INSPECTION_ACTION_PATCH_NAME = 'inspection-action-followup-v4'
+INSPECTION_ACTION_SOURCE_HASH = '535ee88b81b262fa5aedb785466ade9f3183a6417656fb6733427242baac7c9d'
+INSPECTION_ACTION_PATCH_HASH = 'c8e3132374da9d333656114557d9bf7d44dc24e088522ec2668c0fddd5396563'
+INSPECTION_ACTION_OVERLAY_PATH = 'flash_inspection_action_overlay/inference/agent/tool_agent.py'
+ZERO_CHANGE_REPEAT_GUARD_PATCH_NAME = 'zero-change-repeat-guard-v1'
+ZERO_CHANGE_REPEAT_GUARD_SOURCE_HASH = '535ee88b81b262fa5aedb785466ade9f3183a6417656fb6733427242baac7c9d'
+ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH = 'ec358aef45e3d22ee07112a946fcd6f48b7022dde1c01840d966b2087262168c'
+ZERO_CHANGE_REPEAT_GUARD_OVERLAY_PATH = 'flash_zero_change_repeat_guard_overlay/inference/agent/tool_agent.py'
 MAX_TERMINAL_GRACE_SECONDS = 599
 SERVED_MODEL = 'Qwen/Qwen3.8-Flash-Next-NVFP4'
 TUNING = {
@@ -84,11 +100,46 @@ def audit(
     require_runtime_from_ready: bool = False,
     expected_terminal_grace_seconds: int | None = None,
     require_agent_state_patch: bool = False,
+    require_action7_patch: bool = False,
+    require_direct_tool_retry: bool = False,
+    require_inspection_action_patch: bool = False,
+    require_zero_change_repeat_guard: bool = False,
     expected_analyzer_timeout: int = 900,
     kernel_log: str | None = None,
     expected_gameplay_budget_seconds: int | None = None,
 ) -> dict:
     require(mode in ('preflight', 'full-offline'), 'unsupported audit mode')
+    requested_patches = sum((require_action7_patch, require_direct_tool_retry,
+                             require_agent_state_patch, require_inspection_action_patch,
+                             require_zero_change_repeat_guard))
+    require(requested_patches <= 1,
+            'ACTION7, direct-tool retry, reasoning-state, inspection-action, and zero-change guard patches are separate experiments')
+    patch_artifacts = {
+        'ACTION7': (require_action7_patch, 'flash_action7_patch.json', 'flash_action7_overlay',
+                    '--require-action7-patch'),
+        'direct-tool retry': (require_direct_tool_retry, 'flash_direct_retry_patch.json',
+                              'flash_direct_retry_overlay', '--require-direct-tool-retry'),
+        'reasoning-state': (require_agent_state_patch, 'flash_agent_state_patch.json',
+                            'flash_agent_overlay', '--require-agent-state-patch'),
+        'inspection-action': (require_inspection_action_patch, 'flash_inspection_action_patch.json',
+                              'flash_inspection_action_overlay', '--require-inspection-action-patch'),
+        'zero-change guard': (require_zero_change_repeat_guard,
+                              'flash_zero_change_repeat_guard_patch.json',
+                              'flash_zero_change_repeat_guard_overlay',
+                              '--require-zero-change-repeat-guard'),
+    }
+    for label, (requested, artifact, overlay, _flag) in patch_artifacts.items():
+        if not requested:
+            continue
+        for other_label, (other_requested, other_artifact, other_overlay, _other_flag) in patch_artifacts.items():
+            if other_label == label:
+                continue
+            require(not other_requested and not (root / other_artifact).exists()
+                    and not (root / other_overlay).exists(),
+                    f'{label} candidate must not contain the {other_label} overlay')
+    for label, (requested, artifact, overlay, flag) in patch_artifacts.items():
+        if ((root / artifact).exists() or (root / overlay).exists()) and not requested:
+            require(False, f'{label} artifacts require explicit {flag}')
     default_games = 1 if mode == 'preflight' else len(PUBLIC_IDS)
     expected_games = default_games if expected_games is None else expected_games
     expected_concurrency = 28 if expected_concurrency is None else expected_concurrency
@@ -168,6 +219,39 @@ def audit(
                 'agent state patch identity mismatch')
         require(digest(root, AGENT_OVERLAY_PATH) == AGENT_PATCH_HASH,
                 'agent state overlay source changed')
+    expected_action7_patch = {
+        'patch': ACTION7_PATCH_NAME,
+        'source_sha256': ACTION7_SOURCE_HASH,
+        'patched_sha256': ACTION7_PATCH_HASH,
+        'overlay_action_names_sha256': ACTION7_PATCH_HASH,
+    }
+    if require_action7_patch:
+        require(document(root, 'flash_action7_patch.json') == expected_action7_patch,
+                'ACTION7 patch identity mismatch')
+        require(digest(root, ACTION7_OVERLAY_PATH) == ACTION7_PATCH_HASH,
+                'ACTION7 overlay source changed')
+    expected_direct_retry_patch = {
+        'patch': DIRECT_RETRY_PATCH_NAME,
+        'source_sha256': DIRECT_RETRY_SOURCE_HASH,
+        'patched_sha256': DIRECT_RETRY_PATCH_HASH,
+        'overlay_tool_agent_sha256': DIRECT_RETRY_PATCH_HASH,
+    }
+    if require_direct_tool_retry:
+        require(document(root, 'flash_direct_retry_patch.json') == expected_direct_retry_patch,
+                'direct-tool retry patch identity mismatch')
+        require(digest(root, DIRECT_RETRY_OVERLAY_PATH) == DIRECT_RETRY_PATCH_HASH,
+                'direct-tool retry overlay source changed')
+    expected_inspection_action_patch = {
+        'patch': INSPECTION_ACTION_PATCH_NAME,
+        'source_sha256': INSPECTION_ACTION_SOURCE_HASH,
+        'patched_sha256': INSPECTION_ACTION_PATCH_HASH,
+        'overlay_tool_agent_sha256': INSPECTION_ACTION_PATCH_HASH,
+    }
+    if require_inspection_action_patch:
+        require(document(root, 'flash_inspection_action_patch.json') == expected_inspection_action_patch,
+                'inspection-action patch identity mismatch')
+        require(digest(root, INSPECTION_ACTION_OVERLAY_PATH) == INSPECTION_ACTION_PATCH_HASH,
+                'inspection-action overlay source changed')
     provenance = document(root, 'vllm-setup-provenance.json')
     expected = {
         'model_hf_repo': 'RadixArk/Qwen3.8-Flash-Next-NVFP4',
@@ -254,6 +338,93 @@ def audit(
             f'terminal_grace_s={float(expected_terminal_grace_seconds)}' in text,
             'terminal grace configuration mismatch',
         )
+    if require_action7_patch:
+        require(expected_action7_patch in log_json_records(text, 'FLASH_ACTION7_PATCH'),
+                'ACTION7 patch log missing or mismatched')
+        overlay_records = log_json_records(text, 'FLASH_ACTION7_OVERLAY_READY')
+        require(any(
+            isinstance(record.get('root'), str)
+            and record.get('action_names_sha256') == ACTION7_PATCH_HASH
+            for record in overlay_records
+        ), 'ACTION7 overlay-ready log missing or mismatched')
+        require('FLASH_ACTION7_OVERLAY_REASSERTED' in text,
+                'ACTION7 overlay was not reasserted after setup')
+        imported_records = log_json_records(text, 'FLASH_ACTION7_OVERLAY_IMPORTED')
+        require(any(
+            isinstance(record.get('action_names_path'), str)
+            and record['action_names_path'].endswith(ACTION7_OVERLAY_PATH)
+            and record.get('action_names_sha256') == ACTION7_PATCH_HASH
+            for record in imported_records
+        ), 'ACTION7 overlay-import log missing or mismatched')
+    if require_direct_tool_retry:
+        require(expected_direct_retry_patch in log_json_records(text, 'FLASH_DIRECT_RETRY_PATCH'),
+                'direct-tool retry patch log missing or mismatched')
+        ready_records = log_json_records(text, 'FLASH_DIRECT_RETRY_OVERLAY_READY')
+        require(any(
+            isinstance(record.get('root'), str)
+            and record.get('tool_agent_sha256') == DIRECT_RETRY_PATCH_HASH
+            for record in ready_records
+        ), 'direct-tool retry overlay-ready log missing or mismatched')
+        require('FLASH_DIRECT_RETRY_OVERLAY_REASSERTED' in text,
+                'direct-tool retry overlay was not reasserted after setup')
+        imported_records = log_json_records(text, 'FLASH_DIRECT_RETRY_OVERLAY_IMPORTED')
+        require(any(
+            isinstance(record.get('tool_agent_path'), str)
+            and record['tool_agent_path'].endswith(DIRECT_RETRY_OVERLAY_PATH)
+            and record.get('tool_agent_sha256') == DIRECT_RETRY_PATCH_HASH
+            for record in imported_records
+        ), 'direct-tool retry overlay-import log missing or mismatched')
+    if require_inspection_action_patch:
+        require(expected_inspection_action_patch in log_json_records(text, 'FLASH_INSPECTION_ACTION_PATCH'),
+                'inspection-action patch log missing or mismatched')
+        ready_records = log_json_records(text, 'FLASH_INSPECTION_ACTION_OVERLAY_READY')
+        require(any(
+            isinstance(record.get('root'), str)
+            and record.get('tool_agent_sha256') == INSPECTION_ACTION_PATCH_HASH
+            for record in ready_records
+        ), 'inspection-action overlay-ready log missing or mismatched')
+        require('FLASH_INSPECTION_ACTION_OVERLAY_REASSERTED' in text,
+                'inspection-action overlay was not reasserted after setup')
+        imported_records = log_json_records(text, 'FLASH_INSPECTION_ACTION_OVERLAY_IMPORTED')
+        require(any(
+            isinstance(record.get('tool_agent_path'), str)
+            and record['tool_agent_path'].endswith(INSPECTION_ACTION_OVERLAY_PATH)
+            and record.get('tool_agent_sha256') == INSPECTION_ACTION_PATCH_HASH
+            for record in imported_records
+        ), 'inspection-action overlay-import log missing or mismatched')
+    expected_zero_change_repeat_guard_patch = {
+        'patch': ZERO_CHANGE_REPEAT_GUARD_PATCH_NAME,
+        'source_sha256': ZERO_CHANGE_REPEAT_GUARD_SOURCE_HASH,
+        'patched_sha256': ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH,
+        'overlay_tool_agent_sha256': ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH,
+    }
+    if require_zero_change_repeat_guard:
+        require(document(root, 'flash_zero_change_repeat_guard_patch.json') ==
+                expected_zero_change_repeat_guard_patch,
+                'zero-change guard patch identity mismatch')
+        require(digest(root, ZERO_CHANGE_REPEAT_GUARD_OVERLAY_PATH) ==
+                ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH,
+                'zero-change guard overlay source changed')
+        require(expected_zero_change_repeat_guard_patch in
+                log_json_records(text, 'FLASH_ZERO_CHANGE_REPEAT_GUARD_PATCH'),
+                'zero-change guard patch log missing or mismatched')
+        ready_records = log_json_records(text, 'FLASH_ZERO_CHANGE_REPEAT_GUARD_OVERLAY_READY')
+        require(any(
+            isinstance(record.get('root'), str)
+            and record.get('tool_agent_sha256') == ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH
+            for record in ready_records
+        ), 'zero-change guard overlay-ready log missing or mismatched')
+        require('FLASH_ZERO_CHANGE_REPEAT_GUARD_OVERLAY_REASSERTED' in text,
+                'zero-change guard overlay was not reasserted after setup')
+        imported_records = log_json_records(
+            text, 'FLASH_ZERO_CHANGE_REPEAT_GUARD_OVERLAY_IMPORTED'
+        )
+        require(any(
+            isinstance(record.get('tool_agent_path'), str)
+            and record['tool_agent_path'].endswith(ZERO_CHANGE_REPEAT_GUARD_OVERLAY_PATH)
+            and record.get('tool_agent_sha256') == ZERO_CHANGE_REPEAT_GUARD_PATCH_HASH
+            for record in imported_records
+        ), 'zero-change guard overlay-import log missing or mismatched')
     if require_agent_state_patch:
         require(expected_agent_patch in log_json_records(text, 'FLASH_AGENT_STATE_PATCH'),
                 'agent state patch log missing or mismatched')
@@ -287,6 +458,10 @@ def audit(
             'expected_analyzer_timeout': expected_analyzer_timeout,
             'expected_terminal_grace_seconds': expected_terminal_grace_seconds,
             'agent_state_patch_required': require_agent_state_patch,
+            'action7_patch_required': require_action7_patch,
+            'direct_tool_retry_required': require_direct_tool_retry,
+            'inspection_action_patch_required': require_inspection_action_patch,
+            'zero_change_repeat_guard_required': require_zero_change_repeat_guard,
             'require_clean': require_clean,
             'offline_mean': mean,
             'total_actions': sum(len(r['history']) for r in runs),
@@ -320,6 +495,14 @@ def main() -> int:
                         help='Exact downloaded kernel log filename when its slug omits the mode.')
     parser.add_argument('--require-agent-state-patch', action='store_true',
                         help='Require the digest-bound Flash reasoning-state overlay artifacts and logs.')
+    parser.add_argument('--require-action7-patch', action='store_true',
+                        help='Require the digest-bound Flash ACTION7 passthrough artifacts and logs.')
+    parser.add_argument('--require-direct-tool-retry', action='store_true',
+                        help='Require the digest-bound direct-tool retry artifacts and logs.')
+    parser.add_argument('--require-inspection-action-patch', action='store_true',
+                        help='Require the digest-bound inspection-action follow-up artifacts and logs.')
+    parser.add_argument('--require-zero-change-repeat-guard', action='store_true',
+                        help='Require the digest-bound zero-change singleton-repeat guard artifacts and logs.')
     args = parser.parse_args()
     try:
         report = audit(args.output_dir, args.mode,
@@ -332,6 +515,10 @@ def main() -> int:
                        require_runtime_from_ready=args.require_runtime_from_ready,
                        expected_terminal_grace_seconds=args.expected_terminal_grace_seconds,
                        require_agent_state_patch=args.require_agent_state_patch,
+                       require_action7_patch=args.require_action7_patch,
+                       require_direct_tool_retry=args.require_direct_tool_retry,
+                       require_inspection_action_patch=args.require_inspection_action_patch,
+                       require_zero_change_repeat_guard=args.require_zero_change_repeat_guard,
                        expected_analyzer_timeout=args.expected_analyzer_timeout,
                        kernel_log=args.kernel_log)
     except (ValueError, KeyError, TypeError, IndexError, OSError, ImportError) as error:

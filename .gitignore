@@ -213,6 +213,11 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local agent state, nested reference checkouts, and generated code graphs
+.claude/
+external/
+graphify-out/
+
 # Ruff stuff:
 .ruff_cache/
 
