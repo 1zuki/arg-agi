@@ -132,6 +132,7 @@ def _add_preflight_support(
     terminal_grace_seconds: int | None = None,
     analyzer_timeout: int | None = None,
     include_agent_state_patch: bool = False,
+    include_action7_patch: bool = False,
     full_runtime_seconds: int | None = None,
 ) -> None:
     _validate_preflight_setting(max_games, name="max_games", maximum=PUBLIC_GAME_COUNT)
@@ -140,10 +141,24 @@ def _add_preflight_support(
     _validate_preflight_setting(analyzer_timeout, name="analyzer_timeout")
     _validate_terminal_grace_seconds(terminal_grace_seconds)
     _validate_full_runtime_schedule(full_runtime_seconds, concurrency)
+    if include_action7_patch and include_agent_state_patch:
+        raise ValueError(
+            "--action7-patch and --agent-state-patch are mutually exclusive experiments."
+        )
     if game_id is not None and game_id not in PUBLIC_GAME_IDS:
         raise ValueError(f"game_id must be one of the pinned public game IDs: {game_id!r}.")
     if game_id is not None and max_games not in (None, 1):
         raise ValueError("game_id preflights must select exactly one game.")
+
+    if include_action7_patch:
+        intro = notebook["cells"][0]
+        intro["source"] = (
+            "## Experimental ACTION7 passthrough (c28 baseline family)\n\n"
+            "Not a verified score improvement. Keep public submission 56170646 (3.40).\n"
+            "This package adds only the missing ACTION7 reverse mapping under its existing name.\n"
+            "It does not assume ACTION7 means UNDO or enable reasoning-state persistence.\n\n"
+            + "".join(intro.get("source", []))
+        ).splitlines(keepends=True)
 
     start_anchor = "NOTEBOOK_START_EPOCH = time.time()\n"
     full_runtime_injection = (
@@ -253,7 +268,15 @@ def _add_preflight_support(
         (REPO_ROOT / "scripts/flash_agent_state_patch.py").read_text(encoding="utf-8")
         if include_agent_state_patch else ""
     )
-    stage_source = teardown_patch_source + ("\n" + agent_patch_source if agent_patch_source else "") + """
+    action7_patch_source = (
+        (REPO_ROOT / "scripts/flash_action7_patch.py").read_text(encoding="utf-8")
+        if include_action7_patch else ""
+    )
+    stage_source = (
+        teardown_patch_source
+        + ("\n" + action7_patch_source if action7_patch_source else "")
+        + ("\n" + agent_patch_source if agent_patch_source else "")
+        + """
 import hashlib
 
 if json.loads((BUNDLE_DIR / "teardown_commands.json").read_text()) != [
@@ -275,6 +298,41 @@ _teardown_patch_record = {
 print("FLASH_TEARDOWN_PATCH", json.dumps(_teardown_patch_record), flush=True)
 
 """ + ("""
+_action7_source_path = BUNDLE_DIR / "src" / "ARC3-Inference" / "inference" / "agent" / "action_names.py"
+if _action7_source_path.is_symlink() or not _action7_source_path.is_file():
+    raise RuntimeError("Flash action-name source is missing or a symlink.")
+_action7_original = _action7_source_path.read_bytes()
+_action7_patched = patch_action_names(_action7_original)
+FLASH_ACTION7_ROOT = WORKING_DIR / "flash_action7_overlay"
+_action7_overlay = FLASH_ACTION7_ROOT / "inference" / "agent"
+_action7_overlay.mkdir(parents=True, exist_ok=True)
+(FLASH_ACTION7_ROOT / "inference" / "__init__.py").write_text(
+    "from pkgutil import extend_path\\n__path__ = extend_path(__path__, __name__)\\n",
+    encoding="utf-8",
+)
+(_action7_overlay / "__init__.py").write_text(
+    "from pkgutil import extend_path\\n"
+    "__path__ = extend_path(__path__, __name__)\\n"
+    "from inference.agent.tool_agent import ToolAgent\\n"
+    "from inference.agent.runtime_state import Frame, HistoryEntry\\n"
+    "__all__ = [\\\"ToolAgent\\\", \\\"Frame\\\", \\\"HistoryEntry\\\"]\\n",
+    encoding="utf-8",
+)
+_action7_overlay_path = _action7_overlay / "action_names.py"
+_action7_overlay_path.write_text(_action7_patched, encoding="utf-8")
+_action7_patch_record = {
+    "patch": PATCH_NAME,
+    "source_sha256": hashlib.sha256(_action7_original).hexdigest(),
+    "patched_sha256": hashlib.sha256(_action7_patched.encode("utf-8")).hexdigest(),
+    "overlay_action_names_sha256": hashlib.sha256(_action7_overlay_path.read_bytes()).hexdigest(),
+}
+if _action7_patch_record["patched_sha256"] != _action7_patch_record["overlay_action_names_sha256"]:
+    raise RuntimeError("Flash ACTION7 overlay digest changed while staging.")
+(WORKING_DIR / "flash_action7_patch.json").write_text(
+    json.dumps(_action7_patch_record, indent=2) + "\\n", encoding="utf-8"
+)
+print("FLASH_ACTION7_PATCH", json.dumps(_action7_patch_record), flush=True)
+""" if include_action7_patch else "") + ("""
 _agent_source_path = BUNDLE_DIR / "src" / "ARC3-Inference" / "inference" / "agent" / "tool_agent.py"
 if _agent_source_path.is_symlink() or not _agent_source_path.is_file():
     raise RuntimeError("Flash tool-agent source is missing or a symlink.")
@@ -312,6 +370,7 @@ print("FLASH_AGENT_STATE_PATCH", json.dumps(_agent_patch_record), flush=True)
 """ if include_agent_state_patch else "") + """
 
 """
+    )
     setup_matches = 0
     for candidate in notebook["cells"]:
         if candidate.get("cell_type") != "code":
@@ -324,7 +383,26 @@ print("FLASH_AGENT_STATE_PATCH", json.dumps(_agent_patch_record), flush=True)
         raise ValueError(f"Flash setup anchor matched {setup_matches} times; expected once.")
 
     source_path_anchor = "print(f\"taaf.kaggle: wrote {pth_path} ({len(source_entries)} source roots)\")\n"
-    source_path_injection = source_path_anchor + """if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
+    source_path_injection = source_path_anchor
+    if include_action7_patch:
+        source_path_injection += """if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
+    raise RuntimeError("Flash source loaded before the ACTION7 overlay could be installed.")
+sys.path.insert(0, str(FLASH_ACTION7_ROOT))
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    entry for entry in [str(FLASH_ACTION7_ROOT), os.environ.get("PYTHONPATH", "")]
+    if entry
+)
+print(
+    "FLASH_ACTION7_OVERLAY_READY",
+    json.dumps({
+        "root": str(FLASH_ACTION7_ROOT),
+        "action_names_sha256": _action7_patch_record["overlay_action_names_sha256"],
+    }),
+    flush=True,
+)
+"""
+    if include_agent_state_patch:
+        source_path_injection += """if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
     raise RuntimeError("Flash source loaded before the agent-state overlay could be installed.")
 sys.path.insert(0, str(FLASH_AGENT_OVERLAY_ROOT))
 os.environ["PYTHONPATH"] = os.pathsep.join(
@@ -340,8 +418,6 @@ print(
     flush=True,
 )
 """
-    if not include_agent_state_patch:
-        source_path_injection = source_path_anchor
     source_path_matches = 0
     for candidate in notebook["cells"]:
         if candidate.get("cell_type") != "code":
@@ -352,14 +428,50 @@ print(
         candidate["source"] = candidate_source.splitlines(keepends=True)
     if source_path_matches != 1:
         raise ValueError(
-            "Flash agent-state overlay anchor did not match exactly once: "
+            "Flash overlay source anchor did not match exactly once: "
             f"source_path={source_path_matches}."
         )
 
     setup_finish_anchor = """for entry in reversed([e for e in os.environ.get("PYTHONPATH", "").split(os.pathsep) if e]):
     if entry not in sys.path:
         sys.path.insert(0, entry)"""
-    setup_finish_injection = setup_finish_anchor + """
+    setup_finish_injection = setup_finish_anchor
+    if include_action7_patch:
+        setup_finish_injection += """
+
+if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
+    raise RuntimeError("Flash source loaded during setup before the ACTION7 overlay could be used.")
+if str(FLASH_ACTION7_ROOT) in sys.path:
+    sys.path.remove(str(FLASH_ACTION7_ROOT))
+sys.path.insert(0, str(FLASH_ACTION7_ROOT))
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    entry for entry in [
+        str(FLASH_ACTION7_ROOT),
+        *(item for item in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+          if item and item != str(FLASH_ACTION7_ROOT)),
+    ] if entry
+)
+print("FLASH_ACTION7_OVERLAY_REASSERTED", flush=True)
+import importlib
+
+_action7_module = importlib.import_module("inference.agent.action_names")
+_action7_module_path = Path(getattr(_action7_module, "__file__", "")).resolve()
+if _action7_module_path != _action7_overlay_path.resolve():
+    raise RuntimeError(f"Flash ACTION7 overlay was not imported: {_action7_module_path}.")
+_action7_module_sha256 = hashlib.sha256(_action7_module_path.read_bytes()).hexdigest()
+if _action7_module_sha256 != _action7_patch_record["overlay_action_names_sha256"]:
+    raise RuntimeError("Imported Flash ACTION7 overlay digest changed.")
+print(
+    "FLASH_ACTION7_OVERLAY_IMPORTED",
+    json.dumps({
+        "action_names_path": str(_action7_module_path),
+        "action_names_sha256": _action7_module_sha256,
+    }),
+    flush=True,
+)
+"""
+    if include_agent_state_patch:
+        setup_finish_injection += """
 
 if any(name == "inference" or name.startswith("inference.") for name in sys.modules):
     raise RuntimeError("Flash source loaded during setup before the agent-state overlay could be used.")
@@ -394,8 +506,6 @@ print(
     flush=True,
 )
 """
-    if not include_agent_state_patch:
-        setup_finish_injection = setup_finish_anchor
     setup_finish_matches = 0
     for candidate in notebook["cells"]:
         if candidate.get("cell_type") != "code":
@@ -406,7 +516,7 @@ print(
         candidate["source"] = candidate_source.splitlines(keepends=True)
     if setup_finish_matches != 1:
         raise ValueError(
-            "Flash agent-state setup-finish anchor did not match exactly once: "
+            "Flash overlay setup-finish anchor did not match exactly once: "
             f"setup_finish={setup_finish_matches}."
         )
 
@@ -715,6 +825,7 @@ def build(args: argparse.Namespace) -> Path:
         terminal_grace_seconds=terminal_grace_seconds,
         analyzer_timeout=getattr(args, "analyzer_timeout", None),
         include_agent_state_patch=getattr(args, "agent_state_patch", False),
+        include_action7_patch=getattr(args, "action7_patch", False),
         full_runtime_seconds=getattr(args, "full_runtime_seconds", None),
     )
     _clean_execution(notebook)
@@ -793,7 +904,13 @@ def main() -> None:
         action="store_true",
         help="Include the experimental reasoning-state overlay (off by default).",
     )
-    parser.set_defaults(agent_state_patch=False)
+    parser.add_argument(
+        "--action7-patch",
+        dest="action7_patch",
+        action="store_true",
+        help="Include the opt-in ACTION7 passthrough adapter fix (off by default).",
+    )
+    parser.set_defaults(agent_state_patch=False, action7_patch=False)
     build(parser.parse_args())
 
 

@@ -1,0 +1,32 @@
+{
+  "id": "izukia/taaf-flashnext-sheetu12b-repeat",
+  "title": "taaf flashnext sheetu12b repeat control",
+  "code_file": "taaf-flashnext-sheetu12b-repeat.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_tpu": false,
+  "enable_internet": false,
+  "dataset_sources": [
+    "keithtyser/duck-qwen38-nvfp4-mtp-vllm-smoke-v1",
+    "keithtyser/qwen38-flash-next-vllm-nvfp4-runtime-v1"
+  ],
+  "kernel_sources": [],
+  "competition_sources": [
+    "arc-prize-2026-arc-agi-3"
+  ],
+  "model_sources": [
+    "keithtyser/qwen3-8-flash-next-nvfp4/PyTorch/radixark-modelopt-fp4/1"
+  ],
+  "machine_shape": "NvidiaRtxPro6000",
+  "source_sha256": "038cd63314f9fcdb323c89e365928af0b7e9e1fdbd6258c3243d220afcb017e4",
+  "protected_incumbent": {
+    "submission": "56170646",
+    "public_score": 3.4
+  },
+  "experimental_reference": {
+    "sheetu12b_public_score": 5.96,
+    "source_recovered_from": "izukia/taaf-flashnext-sheetu12b-offline-test"
+  }
+}
